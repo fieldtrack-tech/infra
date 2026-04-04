@@ -250,7 +250,9 @@ jobs:
         run: |
           docker stop api-green
           bash scripts/nginx-sync.sh --active-slot blue
-          test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)" = "503"
+          HTTP_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)"
+          echo "Received HTTP code: ${HTTP_CODE}"
+          test "${HTTP_CODE}" = "503"
 
   deploy:
     name: Deploy to VPS
