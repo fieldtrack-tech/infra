@@ -66,7 +66,11 @@ log_ok "Compose files use external api_network"
 log_info "Checking script contract..."
 assert_contains "scripts/bootstrap.sh" "api_network"
 assert_contains "scripts/bootstrap.sh" "STATE_DIR=\"/var/lib/fieldtrack\""
-assert_contains "scripts/nginx-sync.sh" "/var/lib/fieldtrack/active-slot"
+if grep -Fq "active-slot" "scripts/nginx-sync.sh"; then
+  log_error "scripts/nginx-sync.sh must not reference active-slot (slot-based routing was removed)"
+  exit 1
+fi
+log_ok "nginx-sync.sh contains no legacy slot-file references"
 assert_contains "scripts/monitoring-sync.sh" "docker-compose.monitoring.yml"
 log_ok "Scripts match the shared infra contract"
 
@@ -81,7 +85,7 @@ log_info "Checking contract documentation..."
 assert_file_exists "docs/CONTRACT.md"
 assert_contains "docs/CONTRACT.md" "Network: api_network"
 assert_contains "docs/CONTRACT.md" "Containers: api-blue, api-green, redis, nginx"
-assert_contains "docs/CONTRACT.md" "Slot: /var/lib/fieldtrack/active-slot"
+assert_contains "docs/CONTRACT.md" "Routing: health-based (api-blue, api-green)"
 assert_contains "docs/CONTRACT.md" "nginx config: api.conf"
 assert_contains "docs/CONTRACT.md" "Redis: redis:6379"
 log_ok "Contract documentation is present"

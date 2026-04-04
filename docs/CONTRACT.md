@@ -2,6 +2,6 @@
 
 Network: api_network  
 Containers: api-blue, api-green, redis, nginx  
-Slot: /var/lib/fieldtrack/active-slot  
+Routing: health-based (api-blue, api-green)  
 nginx config: api.conf  
 Redis: redis:6379  

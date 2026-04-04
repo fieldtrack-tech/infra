@@ -278,10 +278,9 @@ validate_redis_network
 # ---------------------------------------------------------------------------
 # 3. Render nginx config safely
 # ---------------------------------------------------------------------------
-BOOTSTRAP_SLOT="$(resolve_bootstrap_slot)"
-log_info "Syncing nginx using slot '${BOOTSTRAP_SLOT}'..."
+log_info "Syncing nginx (health-based routing)..."
 
-if ! bash "${SCRIPT_DIR}/nginx-sync.sh" --active-slot "${BOOTSTRAP_SLOT}"; then
+if ! bash "${SCRIPT_DIR}/nginx-sync.sh"; then
   log_error "nginx sync failed during bootstrap."
   exit 1
 fi
