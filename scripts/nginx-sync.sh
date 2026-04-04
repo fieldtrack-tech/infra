@@ -164,6 +164,7 @@ wait_for_nginx_running() {
   local attempt
   local status
 
+  # shellcheck disable=SC2034
   for attempt in $(seq 1 30); do
     status="$(docker inspect --format '{{.State.Status}}' nginx 2>/dev/null || true)"
     if [ "${status}" = "running" ]; then

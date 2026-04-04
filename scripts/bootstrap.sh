@@ -56,6 +56,7 @@ wait_for_redis() {
   local attempt
 
   log_info "Waiting for Redis readiness..."
+  # shellcheck disable=SC2034
   for attempt in $(seq 1 30); do
     if docker exec redis redis-cli ping 2>/dev/null | grep -q '^PONG$'; then
       log_ok "Redis ready"
@@ -83,6 +84,7 @@ wait_for_nginx() {
   local attempt
 
   log_info "Waiting for nginx liveness..."
+  # shellcheck disable=SC2034
   for attempt in $(seq 1 30); do
     if docker exec nginx sh -eu -c "wget -q --spider --timeout=5 --tries=1 http://127.0.0.1/health" >/dev/null 2>&1; then
       log_ok "nginx ready"
