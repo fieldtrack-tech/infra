@@ -1,0 +1,43 @@
+# =============================================================================
+# FieldTrack Infra — .gitignore
+# =============================================================================
+
+# ── Secrets — NEVER commit ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.*.example
+
+# ── Runtime artifacts — generated at deploy time ─────────────────────────────
+
+# Rendered alertmanager config (output of render-alertmanager.sh).
+# Contains no secrets but is an ephemeral artifact; always re-generated
+# from alertmanager/alertmanager.yml template before each deploy.
+alertmanager/alertmanager.rendered.yml
+
+# Rendered Prometheus config (output of render-prometheus.sh).
+prometheus/prometheus.rendered.yml
+
+# Rendered nginx configs (output of nginx-sync.sh).
+# nginx/api.conf is the source template; live/ and backup/ are runtime output.
+nginx/live/*
+nginx/backup/*
+
+# Keep the directory tracked so git clone produces the expected layout
+!nginx/live/.gitkeep
+!nginx/backup/.gitkeep
+
+# ── Docker volume data — managed by Docker, never source ─────────────────────
+grafana/data/
+prometheus/data/
+loki/data/
+promtail/data/
+alertmanager/data/
+
+# ── Editor and OS noise ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+.idea/
+.vscode/

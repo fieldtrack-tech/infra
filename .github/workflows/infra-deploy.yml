@@ -1,0 +1,277 @@
+name: Infra Deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Prevent concurrent deploys — infra changes must be applied serially.
+concurrency:
+  group: infra-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Config
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enforce infra contract
+        run: bash scripts/check-contract.sh
+
+      - name: Install validation tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install yamllint
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck gettext-base -qq
+
+      - name: Prepare monitoring env and rendered config
+        run: |
+          cp .env.monitoring.example .env.monitoring
+          sed -i 's/^API_HOSTNAME=.*/API_HOSTNAME=api.test.local/' .env.monitoring
+          sed -i 's/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=ci-grafana-password/' .env.monitoring
+          sed -i 's/^METRICS_SCRAPE_TOKEN=.*/METRICS_SCRAPE_TOKEN=ci-metrics-token/' .env.monitoring
+          sed -i 's#^ALERTMANAGER_SLACK_WEBHOOK=.*#ALERTMANAGER_SLACK_WEBHOOK=https://hooks.slack.com/services/T00000000/B00000000/CIWEBHOOK#' .env.monitoring
+          bash scripts/render-prometheus.sh
+          bash scripts/render-alertmanager.sh
+
+      - name: Lint YAML
+        run: |
+          yamllint -d relaxed \
+            docker-compose.nginx.yml \
+            docker-compose.redis.yml \
+            docker-compose.monitoring.yml \
+            prometheus/prometheus.yml \
+            prometheus/alerts.yml \
+            alertmanager/alertmanager.yml \
+            loki/loki-config.yaml \
+            promtail/promtail.yml \
+            blackbox/blackbox.yml \
+            grafana/provisioning/dashboards/dashboard.yml \
+            grafana/provisioning/datasources/prometheus.yml
+
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.nginx.yml config --quiet
+          docker compose -f docker-compose.redis.yml config --quiet
+          docker compose --env-file .env.monitoring -f docker-compose.monitoring.yml config --quiet
+
+      - name: Validate Prometheus and Alertmanager configs
+        run: |
+          docker run --rm -v "${PWD}:/workspace" -w /workspace prom/prometheus:v2.52.0 \
+            promtool check config prometheus/prometheus.rendered.yml
+          docker run --rm -v "${PWD}:/workspace" -w /workspace prom/prometheus:v2.52.0 \
+            promtool check rules prometheus/alerts.yml
+          docker run --rm -v "${PWD}:/workspace" -w /workspace prom/alertmanager:v0.27.0 \
+            amtool check-config alertmanager/alertmanager.rendered.yml
+
+      - name: Shellcheck scripts
+        run: |
+          shellcheck -S warning \
+            scripts/check-contract.sh \
+            scripts/bootstrap.sh \
+            scripts/nginx-sync.sh \
+            scripts/monitoring-sync.sh \
+            scripts/render-alertmanager.sh \
+            scripts/render-prometheus.sh \
+            scripts/verify-alertmanager.sh
+
+  smoke-core:
+    name: Smoke Core Infra
+    runs-on: ubuntu-24.04
+    needs: [validate]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare host paths and TLS material
+        run: |
+          sudo mkdir -p /etc/ssl/api /var/www/certbot /var/log/nginx /var/lib/fieldtrack
+          openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout /tmp/origin.key \
+            -out /tmp/origin.crt \
+            -days 1 \
+            -subj "/CN=api.test.local"
+          sudo cp /tmp/origin.crt /etc/ssl/api/origin.crt
+          sudo cp /tmp/origin.key /etc/ssl/api/origin.key
+
+      - name: Ensure shared network
+        run: docker network create api_network || true
+
+      - name: Bootstrap core infra
+        env:
+          API_HOSTNAME: api.test.local
+        run: bash scripts/bootstrap.sh
+
+      - name: Verify Redis readiness
+        run: docker exec redis redis-cli ping | grep -q '^PONG$'
+
+      - name: Verify Redis reachable on api_network
+        run: docker run --rm --network api_network redis:7-alpine redis-cli -h redis ping | grep -q '^PONG$'
+
+      - name: Verify nginx maintenance mode before API
+        run: |
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health >/dev/null
+          test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)" = "503"
+
+      - name: Start mock active API and durable slot
+        run: |
+          cat <<'EOF' >/tmp/mock-api.conf
+          server {
+              listen 3000;
+
+              location = /health {
+                  add_header Content-Type text/plain;
+                  return 200 'ok';
+              }
+
+              location = /ready {
+                  add_header Content-Type text/plain;
+                  return 200 'ready';
+              }
+
+              location / {
+                  add_header Content-Type text/plain;
+                  return 200 'mock-api';
+              }
+          }
+          EOF
+
+          docker run -d --name api-blue --network api_network \
+            -v /tmp/mock-api.conf:/etc/nginx/conf.d/default.conf:ro \
+            nginx:1.25-alpine >/dev/null
+
+          echo blue | sudo tee /var/lib/fieldtrack/active-slot >/dev/null
+
+      - name: Sync nginx to healthy backend
+        env:
+          API_HOSTNAME: api.test.local
+        run: bash scripts/nginx-sync.sh
+
+      - name: Verify routed API health
+        run: |
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health >/dev/null
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-api'
+
+      - name: Start mock fallback API
+        run: |
+          cat <<'EOF' >/tmp/mock-api-green.conf
+          server {
+              listen 3000;
+
+              location = /health {
+                  add_header Content-Type text/plain;
+                  return 200 'ok';
+              }
+
+              location = /ready {
+                  add_header Content-Type text/plain;
+                  return 200 'ready';
+              }
+
+              location / {
+                  add_header Content-Type text/plain;
+                  return 200 'mock-green';
+              }
+          }
+          EOF
+
+          docker run -d --name api-green --network api_network \
+            -v /tmp/mock-api-green.conf:/etc/nginx/conf.d/default.conf:ro \
+            nginx:1.25-alpine >/dev/null
+
+      - name: Verify api-blue and api-green resolve on api_network
+        run: |
+          docker run --rm --network api_network --entrypoint sh nginx:1.25-alpine -eu -c '
+            wget -q --spider --timeout=5 --tries=1 http://api-blue:3000/health
+            wget -q --spider --timeout=5 --tries=1 http://api-green:3000/health
+          '
+
+      - name: Verify stale slot falls back to healthy alternate
+        env:
+          API_HOSTNAME: api.test.local
+        run: |
+          docker stop api-blue
+          bash scripts/nginx-sync.sh --active-slot blue
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-green'
+
+      - name: Verify corrupt slot recovers to healthy backend
+        env:
+          API_HOSTNAME: api.test.local
+        run: |
+          printf 'invalid\n' >/var/lib/fieldtrack/active-slot
+          bash scripts/nginx-sync.sh
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-green'
+
+      - name: Ensure dead backends fall back to maintenance mode
+        env:
+          API_HOSTNAME: api.test.local
+        run: |
+          docker stop api-green
+          bash scripts/nginx-sync.sh --active-slot blue
+          test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)" = "503"
+
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-24.04
+    needs: [validate, smoke-core]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy infra via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            cd ~/infra
+
+            echo "[deploy] Pulling latest infra config..."
+            git pull origin main --ff-only
+
+            if [ ! -f .env.monitoring ]; then
+              echo "[deploy] ERROR .env.monitoring is missing on the VPS." >&2
+              exit 1
+            fi
+
+            set -a
+            . ./.env.monitoring
+            set +a
+            : "${API_HOSTNAME:?API_HOSTNAME missing in .env.monitoring}"
+
+            if ! command -v crontab >/dev/null 2>&1; then
+              echo "[deploy] ERROR crontab not found; watchdog install is required for runtime failover safety." >&2
+              exit 1
+            fi
+            WATCHDOG_TAG="fieldtrack-nginx-watchdog"
+            CRON_LINE="* * * * * cd $HOME/infra && set -a && . ./.env.monitoring && set +a && bash scripts/nginx-sync.sh >> $HOME/infra/nginx-sync-watchdog.log 2>&1 # ${WATCHDOG_TAG}"
+            (
+              crontab -l 2>/dev/null | grep -Fv "${WATCHDOG_TAG}" || true
+              printf '%s\n' "${CRON_LINE}"
+            ) | crontab -
+            echo "[deploy] nginx watchdog cron ensured."
+
+            MONITORING_FAILED=0
+            echo "[deploy] Syncing monitoring stack..."
+            if ! bash scripts/monitoring-sync.sh; then
+              MONITORING_FAILED=1
+              echo "[deploy] Monitoring sync failed; continuing with core infra sync."
+            fi
+
+            echo "[deploy] Syncing nginx config..."
+            bash scripts/nginx-sync.sh
+
+            if [ "${MONITORING_FAILED}" -ne 0 ]; then
+              echo "[deploy] WARNING monitoring stack is unhealthy. Core infra changes were still applied."
+            fi
+
+            echo "[deploy] Done."
