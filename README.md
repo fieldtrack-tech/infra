@@ -188,8 +188,8 @@ The API's `.env` file is **not used** by this repository.
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/bootstrap.sh` | First-time VPS setup — creates `api_network`, starts Redis + nginx |
-| `scripts/nginx-sync.sh` | Renders nginx config from template and reloads nginx |
+| `scripts/bootstrap.sh` | First-time VPS setup — creates `api_network`, starts Redis + nginx. **Self-healing**: validates infra completeness, initializes state files, ensures directories exist |
+| `scripts/nginx-sync.sh` | Renders nginx config from template and reloads nginx. **Self-healing**: validates config matches mode, prevents 502 errors, auto-rolls back on failure |
 | `scripts/monitoring-sync.sh` | Starts / updates the monitoring stack; never touches API containers |
 | `scripts/render-prometheus.sh` | Renders `prometheus.yml` template into `prometheus.rendered.yml` |
 | `scripts/render-alertmanager.sh` | Renders `alertmanager.yml` template into `alertmanager.rendered.yml` |
@@ -198,8 +198,21 @@ The API's `.env` file is **not used** by this repository.
 | `scripts/validate-secrets.sh` | Validates environment variables and secrets configuration |
 | `scripts/validate-paths.sh` | Validates infra repository path setup and required directories |
 | `scripts/validate-nginx-configs.sh` | Validates nginx configs (ensures maintenance mode has no proxy directives) |
+| `scripts/validate-system.sh` | Comprehensive system validation - runs all validation scripts |
 
 All scripts validate they're running from `/opt/infra` on production and log warnings if not.
+
+### Self-Healing Features
+
+The infra system is designed to be fully self-healing:
+
+- **Idempotent operations**: All scripts can be run multiple times safely
+- **State initialization**: Missing state files are automatically created
+- **Directory management**: Required directories are created with correct permissions
+- **Config validation**: Invalid configs are rejected before application
+- **Automatic rollback**: Failed nginx reloads trigger automatic rollback
+- **502 prevention**: Maintenance mode is validated to never proxy to backends
+- **Bootstrap on deploy**: CI runs bootstrap before every deployment to ensure system state
 
 ---
 

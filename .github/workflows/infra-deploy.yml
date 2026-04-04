@@ -33,6 +33,9 @@ jobs:
       - name: Validate nginx configs
         run: bash scripts/validate-nginx-configs.sh
 
+      - name: Run comprehensive system validation
+        run: bash scripts/validate-system.sh
+
       - name: Install validation tools
         run: |
           python -m pip install --upgrade pip
@@ -334,10 +337,19 @@ jobs:
           port: ${{ secrets.VPS_SSH_PORT || 22 }}
           script: |
             set -euo pipefail
+            
+            # Ensure we're at canonical path
             cd /opt/infra
 
-            echo "[deploy] Pulling latest infra config..."
-            git pull origin main --ff-only
+            echo "[deploy] Fetching latest infra config..."
+            git fetch origin
+            git reset --hard origin/main
+            
+            echo "[deploy] Validating infra completeness..."
+            bash scripts/validate-paths.sh || {
+              echo "[deploy] ERROR: Infra validation failed"
+              exit 1
+            }
 
             if [ ! -f .env.monitoring ]; then
               echo "[deploy] ERROR .env.monitoring is missing on the VPS." >&2
@@ -348,6 +360,12 @@ jobs:
             . ./.env.monitoring
             set +a
             : "${API_HOSTNAME:?API_HOSTNAME missing in .env.monitoring}"
+            
+            echo "[deploy] Running bootstrap to ensure system state..."
+            bash scripts/bootstrap.sh || {
+              echo "[deploy] ERROR: Bootstrap failed"
+              exit 1
+            }
 
             if ! command -v crontab >/dev/null 2>&1; then
               echo "[deploy] ERROR crontab not found; watchdog install is required for runtime failover safety." >&2

@@ -336,6 +336,20 @@ rollback_live_config() {
     docker compose -f "${NGINX_COMPOSE_FILE}" stop nginx >/dev/null 2>&1 || true
     log_info "Removed candidate config and stopped nginx (no backup was available)"
   fi
+  
+  # Print debugging information on rollback
+  log_error "=== ROLLBACK DEBUGGING INFO ==="
+  log_error "Active slot: ${ACTIVE_SLOT:-unknown}"
+  log_error "Selected slot: ${SELECTED_SLOT:-unknown}"
+  log_error "Routing mode: ${ROUTING_MODE:-unknown}"
+  log_error "Rendered config: ${OUTPUT_FILE}"
+  if [ -f "${OUTPUT_FILE}" ]; then
+    log_error "Config preview (first 20 lines):"
+    head -20 "${OUTPUT_FILE}" | sed 's/^/  /' >&2
+  fi
+  log_error "Nginx error log (last 20 lines):"
+  docker exec nginx cat /var/log/nginx/api_error.log 2>/dev/null | tail -20 | sed 's/^/  /' >&2 || log_error "Could not read nginx error log"
+  log_error "=== END DEBUGGING INFO ==="
 }
 
 heal_slot_file_if_needed() {
@@ -478,6 +492,34 @@ cleanup() {
 trap cleanup EXIT
 
 render_template "${TARGET_TEMPLATE}" "${TEMP_CONF_DIR}/api.conf"
+
+# CRITICAL: Validate config matches expected mode
+log_info "Validating rendered config matches mode: ${ROUTING_MODE}"
+if [ "${ROUTING_MODE}" = "maintenance" ]; then
+  # Maintenance mode MUST NOT have proxy directives
+  if grep -v "^[[:space:]]*#" "${TEMP_CONF_DIR}/api.conf" | grep -qE "proxy_pass|upstream|api-blue|api-green"; then
+    log_error "CRITICAL: Maintenance config contains proxy directives or backend references"
+    log_error "This will cause 502 errors. Config validation failed."
+    grep -n "proxy_pass\|upstream\|api-blue\|api-green" "${TEMP_CONF_DIR}/api.conf" || true
+    exit 1
+  fi
+  log_ok "Maintenance config validated: no proxy directives"
+  
+  # Verify maintenance config returns 503 for root
+  if ! grep -q "return 503" "${TEMP_CONF_DIR}/api.conf"; then
+    log_error "CRITICAL: Maintenance config does not return 503"
+    exit 1
+  fi
+  log_ok "Maintenance config validated: returns 503"
+else
+  # Active mode MUST have upstream or proxy_pass
+  if ! grep -v "^[[:space:]]*#" "${TEMP_CONF_DIR}/api.conf" | grep -qE "proxy_pass|upstream"; then
+    log_error "CRITICAL: Active config missing proxy directives"
+    exit 1
+  fi
+  log_ok "Active config validated: has proxy directives"
+fi
+
 validate_candidate_config "${TEMP_CONF_DIR}"
 log_ok "Candidate nginx config validated"
 
@@ -512,6 +554,23 @@ if ! wait_for_nginx_running; then
   log_error "nginx failed to reach running state. Rolling back..."
   rollback_live_config
   exit 1
+fi
+
+# Post-reload validation: Verify nginx is responding correctly
+log_info "Validating nginx responses match expected mode..."
+if [ "${ROUTING_MODE}" = "maintenance" ]; then
+  # In maintenance mode, root should return 503, not 502
+  HTTP_CODE="$(docker exec nginx sh -c "wget -q -O /dev/null -S http://127.0.0.1/ 2>&1 | grep 'HTTP/' | awk '{print \$2}'" || echo "000")"
+  if [ "${HTTP_CODE}" = "502" ]; then
+    log_error "CRITICAL: Maintenance mode returned 502 (backend resolution failure)"
+    log_error "This means nginx is trying to proxy to backends that don't exist"
+    rollback_live_config
+    exit 1
+  elif [ "${HTTP_CODE}" = "503" ]; then
+    log_ok "Maintenance mode correctly returns 503"
+  else
+    log_warn "Maintenance mode returned unexpected code: ${HTTP_CODE} (expected 503)"
+  fi
 fi
 
 if [ "${ROUTING_MODE}" = "active" ]; then

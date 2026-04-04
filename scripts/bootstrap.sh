@@ -41,6 +41,81 @@ log_warn()  { printf '[bootstrap] WARN  %s\n' "$*" >&2; }
 log_error() { printf '[bootstrap] ERROR %s\n' "$*" >&2; }
 log_ok()    { printf '[bootstrap] OK    %s\n' "$*"; }
 
+# ---------------------------------------------------------------------------
+# Pre-flight checks: Validate infra completeness
+# ---------------------------------------------------------------------------
+log_info "Validating infra repository completeness..."
+
+REQUIRED_FILES=(
+  "${INFRA_DIR}/nginx/api.conf"
+  "${INFRA_DIR}/nginx/api.maintenance.conf"
+  "${INFRA_DIR}/docker-compose.nginx.yml"
+  "${INFRA_DIR}/docker-compose.redis.yml"
+  "${INFRA_DIR}/scripts/nginx-sync.sh"
+)
+
+MISSING_FILES=()
+for file in "${REQUIRED_FILES[@]}"; do
+  if [ ! -f "${file}" ]; then
+    MISSING_FILES+=("${file}")
+  fi
+done
+
+if [ ${#MISSING_FILES[@]} -gt 0 ]; then
+  log_error "CRITICAL: Infra repository is incomplete. Missing files:"
+  printf '  - %s\n' "${MISSING_FILES[@]}"
+  log_error "Ensure /opt/infra is properly cloned and up to date."
+  exit 1
+fi
+log_ok "Infra repository is complete"
+
+# ---------------------------------------------------------------------------
+# Ensure required directories exist and are writable
+# ---------------------------------------------------------------------------
+log_info "Ensuring required directories exist..."
+
+REQUIRED_DIRS=(
+  "${STATE_DIR}"
+  "${INFRA_DIR}/nginx/live"
+  "${INFRA_DIR}/nginx/backup"
+  "/var/www/certbot"
+  "/var/log/nginx"
+)
+
+for dir in "${REQUIRED_DIRS[@]}"; do
+  if [ ! -d "${dir}" ]; then
+    log_info "Creating directory: ${dir}"
+    if [[ "${dir}" == /var/* ]] || [[ "${dir}" == /etc/* ]]; then
+      sudo mkdir -p "${dir}"
+      sudo chown -R $USER:$USER "${dir}" 2>/dev/null || true
+    else
+      mkdir -p "${dir}"
+    fi
+  fi
+  
+  if [ ! -w "${dir}" ]; then
+    log_warn "Directory not writable: ${dir}"
+    if [[ "${dir}" == /var/* ]] || [[ "${dir}" == /etc/* ]]; then
+      sudo chown -R $USER:$USER "${dir}" 2>/dev/null || true
+    fi
+  fi
+done
+log_ok "All required directories exist"
+
+# ---------------------------------------------------------------------------
+# Initialize state files if missing
+# ---------------------------------------------------------------------------
+log_info "Initializing state files..."
+
+if [ ! -f "${ACTIVE_SLOT_FILE}" ]; then
+  log_info "Creating initial active-slot file: blue"
+  printf 'blue\n' > "${ACTIVE_SLOT_FILE}"
+  log_ok "Active slot initialized to 'blue'"
+else
+  CURRENT_SLOT="$(cat "${ACTIVE_SLOT_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  log_info "Active slot file exists: ${CURRENT_SLOT}"
+fi
+
 install_nginx_watchdog() {
   local watchdog_tag="fieldtrack-nginx-watchdog"
   local cron_line
@@ -236,6 +311,5 @@ if [ "${MONITORING_FAILED}" = "true" ]; then
 fi
 
 log_info ""
-log_info "On a fresh VPS, nginx may start in maintenance mode until the first healthy API slot is deployed."
-log_info "You can now run the first API deployment from the API repo:"
-log_info "  ./scripts/deploy.sh <image-sha>"
+log_info "Bootstrap complete. System is ready for API deployment."
+log_info "Nginx is configured and will serve maintenance mode until first healthy API slot."
