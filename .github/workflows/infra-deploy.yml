@@ -27,6 +27,9 @@ jobs:
       - name: Validate secrets configuration
         run: bash scripts/validate-secrets.sh
 
+      - name: Validate path setup
+        run: bash scripts/validate-paths.sh
+
       - name: Install validation tools
         run: |
           python -m pip install --upgrade pip
@@ -328,7 +331,7 @@ jobs:
           port: ${{ secrets.VPS_SSH_PORT || 22 }}
           script: |
             set -euo pipefail
-            cd ~/infra
+            cd /opt/infra
 
             echo "[deploy] Pulling latest infra config..."
             git pull origin main --ff-only
@@ -348,7 +351,7 @@ jobs:
               exit 1
             fi
             WATCHDOG_TAG="fieldtrack-nginx-watchdog"
-            CRON_LINE="* * * * * cd $HOME/infra && set -a && . ./.env.monitoring && set +a && bash scripts/nginx-sync.sh >> $HOME/infra/nginx-sync-watchdog.log 2>&1 # ${WATCHDOG_TAG}"
+            CRON_LINE="* * * * * cd /opt/infra && set -a && . ./.env.monitoring && set +a && bash scripts/nginx-sync.sh >> /opt/infra/nginx-sync-watchdog.log 2>&1 # ${WATCHDOG_TAG}"
             (
               crontab -l 2>/dev/null | grep -Fv "${WATCHDOG_TAG}" || true
               printf '%s\n' "${CRON_LINE}"

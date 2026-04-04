@@ -6,6 +6,9 @@
 # infra/alertmanager/alertmanager.rendered.yml by substituting
 # ${ALERTMANAGER_SLACK_WEBHOOK} from infra/.env.monitoring.
 #
+# CANONICAL PATH: /opt/infra
+# This script expects to be run from the infra repository root.
+#
 # MUST be run before `docker compose up` for the monitoring stack.
 # Alertmanager does NOT support environment variables natively — rendering
 # the config before container start is the only safe approach.
@@ -25,6 +28,12 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Validate we're running from the expected location
+EXPECTED_INFRA_ROOT="/opt/infra"
+if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
+  echo "[render-alertmanager] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}" >&2
+fi
 
 ENV_FILE="${INFRA_DIR}/.env.monitoring"
 TEMPLATE_FILE="${INFRA_DIR}/alertmanager/alertmanager.yml"

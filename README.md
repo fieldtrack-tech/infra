@@ -25,6 +25,18 @@ The monitoring stack is **optional** — stopping or removing it has zero effect
 
 ## Architecture
 
+### Canonical Path
+
+The infra repository MUST be cloned to `/opt/infra` on production VPS. This is the canonical path that:
+- All scripts expect and validate
+- The CI deployment workflow uses
+- The API repository's deployment scripts reference
+- Cron jobs and watchdogs are configured with
+
+Running from a different path will trigger warnings in scripts. For local development and CI testing, scripts will work from any path but will log warnings.
+
+### Network Architecture
+
 ```
 Internet
     │
@@ -61,12 +73,16 @@ nginx uses a variable-based proxy (`$api_backend`) resolved at request time via 
 - Docker CE and Docker Compose v2 installed
 - SSL certificate and key at `/etc/ssl/api/origin.crt` and `/etc/ssl/api/origin.key`
 - `.env.monitoring` created from `.env.monitoring.example` (only needed for monitoring)
+- Infra repository cloned to `/opt/infra` (canonical path)
 
 ### Steps
 
 ```bash
-git clone <infra-repo-url> ~/infra
-cd ~/infra
+# Clone to canonical path
+sudo mkdir -p /opt
+sudo chown $USER:$USER /opt
+git clone <infra-repo-url> /opt/infra
+cd /opt/infra
 
 # Required: set your API hostname
 export API_HOSTNAME=api.example.com
@@ -180,6 +196,9 @@ The API's `.env` file is **not used** by this repository.
 | `scripts/verify-alertmanager.sh` | Smoke-tests Alertmanager health and routing after a config change |
 | `scripts/validate-docker-cli.sh` | Validates Docker CLI commands use correct --entrypoint flags |
 | `scripts/validate-secrets.sh` | Validates environment variables and secrets configuration |
+| `scripts/validate-paths.sh` | Validates infra repository path setup and required directories |
+
+All scripts validate they're running from `/opt/infra` on production and log warnings if not.
 
 ---
 

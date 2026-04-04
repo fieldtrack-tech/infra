@@ -5,6 +5,9 @@
 # Safely renders the nginx config and only switches traffic when the selected
 # backend is alive on api_network.
 #
+# CANONICAL PATH: /opt/infra
+# This script expects to be run from the infra repository root.
+#
 # Slot ownership contract:
 #   - API repo writes /var/lib/fieldtrack/active-slot atomically
 #   - Infra repo reads it here and repairs stale/corrupt state when necessary
@@ -27,6 +30,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Validate we're running from the expected location
+EXPECTED_INFRA_ROOT="/opt/infra"
+if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
+  echo "[nginx-sync] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}" >&2
+  echo "[nginx-sync] WARN  For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}" >&2
+fi
 
 STATE_DIR="/var/lib/fieldtrack"
 ACTIVE_SLOT_FILE="${STATE_DIR}/active-slot"

@@ -4,11 +4,20 @@
 #
 # Renders prometheus/prometheus.yml into prometheus/prometheus.rendered.yml
 # using the values from .env.monitoring.
+#
+# CANONICAL PATH: /opt/infra
+# This script expects to be run from the infra repository root.
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Validate we're running from the expected location
+EXPECTED_INFRA_ROOT="/opt/infra"
+if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
+  echo "[render-prometheus] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}" >&2
+fi
 
 ENV_FILE="${INFRA_DIR}/.env.monitoring"
 TEMPLATE_FILE="${INFRA_DIR}/prometheus/prometheus.yml"

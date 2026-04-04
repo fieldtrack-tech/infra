@@ -5,12 +5,22 @@
 # Starts or updates the monitoring stack (Prometheus, Grafana, Alertmanager,
 # Loki, Promtail, Blackbox, Redis exporter, node-exporter).
 #
+# CANONICAL PATH: /opt/infra
+# This script expects to be run from the infra repository root.
+#
 # This script NEVER touches nginx or Redis containers.
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Validate we're running from the expected location
+EXPECTED_INFRA_ROOT="/opt/infra"
+if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
+  echo "[monitoring-sync] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}" >&2
+  echo "[monitoring-sync] WARN  For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}" >&2
+fi
 
 ENV_FILE="${INFRA_DIR}/.env.monitoring"
 COMPOSE_FILE="${INFRA_DIR}/docker-compose.monitoring.yml"

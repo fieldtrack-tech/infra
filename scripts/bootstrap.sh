@@ -5,6 +5,9 @@
 # First-time VPS setup for FieldTrack core infra.
 # Creates api_network, starts Redis, validates it, and starts nginx safely.
 #
+# CANONICAL PATH: /opt/infra
+# This script expects to be run from the infra repository root.
+#
 # Usage:
 #   bash scripts/bootstrap.sh [--with-monitoring]
 #
@@ -15,6 +18,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Validate we're running from the expected location
+EXPECTED_INFRA_ROOT="/opt/infra"
+if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
+  echo "[bootstrap] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}"
+  echo "[bootstrap] WARN  For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}"
+fi
 STATE_DIR="/var/lib/fieldtrack"
 ACTIVE_SLOT_FILE="${STATE_DIR}/active-slot"
 
