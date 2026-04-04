@@ -2,30 +2,23 @@
 # =============================================================================
 # scripts/nginx-sync.sh
 #
-# Safely renders the nginx config and only switches traffic when the selected
-# backend is alive on api_network.
+# Health-based nginx routing controller.
+# Probes api-blue and api-green on every run and routes to whichever backend
+# is stable and reachable from both host and nginx network.
 #
 # CANONICAL PATH: /opt/infra
-# This script expects to be run from the infra repository root.
-#
-# Slot ownership contract:
-#   - API repo writes /var/lib/fieldtrack/active-slot atomically
-#   - Infra repo reads it here and repairs stale/corrupt state when necessary
 #
 # Usage:
 #   bash scripts/nginx-sync.sh
-#   bash scripts/nginx-sync.sh --active-slot blue
-#   bash scripts/nginx-sync.sh --active-slot blue --allow-missing-backend
+#   bash scripts/nginx-sync.sh --allow-missing-backend
 #
 # Options:
-#   --active-slot <blue|green>     Override slot instead of reading from file
-#   --allow-missing-backend        Kept for backward compatibility; maintenance
-#                                  mode is now used automatically when no
-#                                  healthy backend exists
+#   --allow-missing-backend   Suppress the warning when entering maintenance mode
 #
 # Required environment:
 #   API_HOSTNAME   Public hostname served by nginx (no scheme, no slash)
 # =============================================================================
+
 set -euo pipefail
 
 INFRA_ROOT="/opt/infra"
@@ -50,7 +43,6 @@ log_warn()  { printf '[nginx-sync] WARN  %s\n' "$*" >&2; }
 log_error() { printf '[nginx-sync] ERROR %s\n' "$*" >&2; }
 log_ok()    { printf '[nginx-sync] OK    %s\n' "$*"; }
 
-ACTIVE_SLOT_OVERRIDE=""
 ALLOW_MISSING_BACKEND=false
 ACTIVE_SLOT=""
 ACTIVE_SLOT_SOURCE="unknown"
@@ -63,10 +55,6 @@ ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --active-slot)
-      ACTIVE_SLOT_OVERRIDE="${2:-}"
-      shift 2
-      ;;
     --allow-missing-backend)
       ALLOW_MISSING_BACKEND=true
       shift
