@@ -25,6 +25,26 @@ if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
   echo "[bootstrap] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}"
   echo "[bootstrap] WARN  For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}"
 fi
+
+# Ensure infra root exists
+if [ ! -d "${EXPECTED_INFRA_ROOT}" ]; then
+  sudo mkdir -p "${EXPECTED_INFRA_ROOT}"
+  sudo chown -R $USER:$USER "${EXPECTED_INFRA_ROOT}" 2>/dev/null || true
+fi
+
+# Ensure repo is present
+if [ ! -d "${EXPECTED_INFRA_ROOT}/.git" ]; then
+  git clone https://github.com/fieldtrack-tech/infra.git "${EXPECTED_INFRA_ROOT}"
+fi
+
+if [ ! -f "${INFRA_DIR}/.env.monitoring" ]; then
+  echo "[bootstrap] ERROR .env.monitoring is missing in ${INFRA_DIR}. Cannot proceed." >&2
+  exit 1
+fi
+
+set -a
+source "${INFRA_DIR}/.env.monitoring"
+set +a
 STATE_DIR="/var/lib/fieldtrack"
 ACTIVE_SLOT_FILE="${STATE_DIR}/active-slot"
 

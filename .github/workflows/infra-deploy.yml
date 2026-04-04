@@ -216,6 +216,13 @@ jobs:
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health >/dev/null
           # Verify /health now proxies to backend and returns 200
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health >/dev/null
+          
+          # ACTIVE MODE: must NOT contain "maintenance"
+          if curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health | grep -q "maintenance"; then
+            echo "ERROR: Active mode /health contains 'maintenance'!"
+            exit 1
+          fi
+          
           # Verify API content is served
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-api'
 
@@ -350,12 +357,20 @@ jobs:
           script: |
             set -euo pipefail
             
-            # Ensure we're at canonical path
+            # Completely safe automation
+            if [ ! -d /opt/infra/.git ]; then
+                echo "[deploy] Cloning infra repository..."
+                sudo mkdir -p /opt/infra
+                sudo chown -R $USER:$USER /opt/infra
+                git clone https://github.com/fieldtrack-tech/infra.git /opt/infra
+            fi
+            
             cd /opt/infra
-
             echo "[deploy] Fetching latest infra config..."
             git fetch origin
             git reset --hard origin/main
+            
+            sudo chown -R $USER:$USER /opt/infra
             
             echo "[deploy] Validating infra completeness..."
             bash scripts/validate-paths.sh || {
@@ -363,16 +378,6 @@ jobs:
               exit 1
             }
 
-            if [ ! -f .env.monitoring ]; then
-              echo "[deploy] ERROR .env.monitoring is missing on the VPS." >&2
-              exit 1
-            fi
-
-            set -a
-            . ./.env.monitoring
-            set +a
-            : "${API_HOSTNAME:?API_HOSTNAME missing in .env.monitoring}"
-            
             echo "[deploy] Running bootstrap to ensure system state..."
             bash scripts/bootstrap.sh || {
               echo "[deploy] ERROR: Bootstrap failed"
@@ -405,4 +410,45 @@ jobs:
               echo "[deploy] WARNING monitoring stack is unhealthy. Core infra changes were still applied."
             fi
 
+            echo "[deploy] Deterministic execution controller waiting for convergence limits..."
+            validate_state() {
+              local VALIDATED=0
+              for i in {1..10}; do
+                 INFRA_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/infra/health || echo "000")"
+                 HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health || echo "000")"
+                 HEALTH_BODY="$(curl -s http://localhost/health 2>/dev/null || echo "")"
+                 
+                 MATCH=1
+                 if [ "${INFRA_CODE}" != "200" ]; then MATCH=0; fi
+                 
+                 if [ ! -f /var/lib/fieldtrack/active-slot ] || ! grep -qwE "(blue|green)" /var/lib/fieldtrack/active-slot; then
+                   if [ "${HEALTH_CODE}" != "503" ] || ! echo "${HEALTH_BODY}" | grep -q 'maintenance'; then MATCH=0; fi
+                 else
+                   if echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
+                     if [ "${HEALTH_CODE}" != "503" ]; then MATCH=0; fi
+                   elif [ "${HEALTH_CODE}" != "200" ]; then MATCH=0; fi
+                 fi
+
+                 if [ "${MATCH}" -eq 1 ]; then
+                   echo "[deploy] System state intrinsically valid at iteration ${i}."
+                   return 0
+                 fi
+                 
+                 echo "[deploy] Mismatch observed on iteration ${i}. Sleeping 2s..."
+                 sleep 2
+              done
+              return 1
+            }
+
+            if ! validate_state; then
+              echo "[deploy] ERROR: Controller hit limit. Enforcing Auto-Recovery..."
+              bash scripts/nginx-sync.sh || true
+              
+              if ! validate_state; then
+                echo "[deploy] FATAL: System explicitly failed all convergence paths. Aborting."
+                exit 1
+              fi
+            fi
+
+            echo "[deploy] Final runtime validation complete."
             echo "[deploy] Done."

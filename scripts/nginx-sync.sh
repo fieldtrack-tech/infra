@@ -28,26 +28,25 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+INFRA_ROOT="/opt/infra"
+STATE_DIR="/var/lib/fieldtrack"
+LOG_DIR="/var/log/fieldtrack"
 
-# Validate we're running from the expected location
-EXPECTED_INFRA_ROOT="/opt/infra"
-if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
-  echo "[nginx-sync] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}" >&2
-  echo "[nginx-sync] WARN  For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}" >&2
+if [ -f "${INFRA_ROOT}/.env.monitoring" ]; then
+  set -a
+  source "${INFRA_ROOT}/.env.monitoring"
+  set +a
 fi
 
-STATE_DIR="/var/lib/fieldtrack"
 ACTIVE_SLOT_FILE="${STATE_DIR}/active-slot"
 SLOT_BACKUP_FILE="${STATE_DIR}/active-slot.backup"
 LAST_GOOD_FILE="${STATE_DIR}/last-good"
-TEMPLATE_FILE="${INFRA_DIR}/nginx/api.conf"
-MAINTENANCE_TEMPLATE_FILE="${INFRA_DIR}/nginx/api.maintenance.conf"
-LIVE_DIR="${INFRA_DIR}/nginx/live"
-BACKUP_DIR="${INFRA_DIR}/nginx/backup"
+TEMPLATE_FILE="${INFRA_ROOT}/nginx/api.conf"
+MAINTENANCE_TEMPLATE_FILE="${INFRA_ROOT}/nginx/api.maintenance.conf"
+LIVE_DIR="${INFRA_ROOT}/nginx/live"
+BACKUP_DIR="${INFRA_ROOT}/nginx/backup"
 OUTPUT_FILE="${LIVE_DIR}/api.conf"
-NGINX_COMPOSE_FILE="${INFRA_DIR}/docker-compose.nginx.yml"
+NGINX_COMPOSE_FILE="${INFRA_ROOT}/docker-compose.nginx.yml"
 
 log_info()  { printf '[nginx-sync] INFO  %s\n' "$*"; }
 log_warn()  { printf '[nginx-sync] WARN  %s\n' "$*" >&2; }
@@ -58,12 +57,14 @@ ACTIVE_SLOT_OVERRIDE=""
 ALLOW_MISSING_BACKEND=false
 ACTIVE_SLOT=""
 ACTIVE_SLOT_SOURCE="unknown"
+ACTIVE_SLOT_ACTION="SWITCH"  # SWITCH or NO-OP
 SELECTED_SLOT=""
 SELECTED_CONTAINER=""
 ROUTING_MODE="active"
 FALLBACK_USED=false
 RECOVERED_SLOT=false
 EXPECTED_DEPLOY_SHA="${EXPECTED_DEPLOY_SHA:-}"
+ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -250,57 +251,42 @@ backend_is_usable() {
   local slot="$1"
   local container_name="api-${slot}"
 
-  if ! backend_exists "${container_name}"; then
+  if ! backend_exists "${container_name}" || ! backend_running "${container_name}" || \
+     ! backend_attached_to_network "${container_name}" || ! backend_matches_expected_sha "${container_name}"; then
     return 1
   fi
 
-  if ! backend_running "${container_name}"; then
-    return 1
-  fi
-
-  if ! backend_attached_to_network "${container_name}"; then
-    return 1
-  fi
-
-  if ! backend_matches_expected_sha "${container_name}"; then
-    return 1
-  fi
-
-  run_probe_with_retries "Direct backend probe for ${container_name}" probe_backend_direct "${container_name}"
-}
-
-discover_slot_from_backends() {
-  local blue_usable=false
-  local green_usable=false
-  local live_slot=""
-
-  if backend_is_usable blue; then
-    blue_usable=true
-  fi
-
-  if backend_is_usable green; then
-    green_usable=true
-  fi
-
-  if [ "${blue_usable}" = "true" ] && [ "${green_usable}" = "false" ]; then
-    printf 'blue'
-    return 0
-  fi
-
-  if [ "${green_usable}" = "true" ] && [ "${blue_usable}" = "false" ]; then
-    printf 'green'
-    return 0
-  fi
-
-  if [ "${blue_usable}" = "true" ] && [ "${green_usable}" = "true" ]; then
-    live_slot="$(read_slot_from_live_config)"
-    if is_valid_slot "${live_slot}"; then
-      printf '%s' "${live_slot}"
-    else
-      printf 'blue'
+  log_info "Evaluating backend stability for ${container_name}..."
+  local success=0
+  for i in 1 2 3; do
+    # 1. Host trace validation
+    if docker run --rm --network api_network --entrypoint sh nginx:1.25-alpine -eu -c "wget -q --spider --timeout=5 --tries=1 http://${container_name}:3000/health" >/dev/null 2>&1; then
+      # 2. Split-brain Nginx container reachability assertion
+      if docker ps -q --filter "name=^nginx$" | grep -q . ; then
+          if docker exec nginx sh -eu -c "wget -qO- http://${container_name}:3000/health" >/dev/null 2>&1; then
+            success=$((success+1))
+          fi
+      else
+          # Nginx not running locally yet? Map host success accurately.
+          success=$((success+1))
+      fi
     fi
+    sleep 1
+  done
+
+  mkdir -p /var/log/fieldtrack
+  if [ "${success}" -ge 3 ]; then
+    log_ok "${container_name} is STABLE_HEALTHY (Passed 3/3)"
+    echo "$(date -u +%FT%TZ) | ${container_name} | STABLE_HEALTHY | reachability_passed_3_of_3" >> /var/log/fieldtrack/nginx-sync.log || true
+    return 0
+  else
+    log_warn "${container_name} is UNSTABLE (Passed ${success}/3)"
+    echo "$(date -u +%FT%TZ) | ${container_name} | UNSTABLE | reachability_passed_${success}_of_3" >> /var/log/fieldtrack/nginx-sync.log || true
+    return 1
   fi
 }
+
+# discover_slot_from_backends removed — resolve_active_slot is the single authority.
 
 persist_slot_file() {
   local slot="$1"
@@ -371,98 +357,113 @@ heal_slot_file_if_needed() {
 }
 
 resolve_active_slot() {
-  local candidate=""
+  local blue_usable=false
+  local green_usable=false
 
-  if [ -n "${ACTIVE_SLOT_OVERRIDE}" ]; then
-    if is_valid_slot "${ACTIVE_SLOT_OVERRIDE}"; then
-      ACTIVE_SLOT="${ACTIVE_SLOT_OVERRIDE}"
-      ACTIVE_SLOT_SOURCE="override"
-      log_info "Active slot (override): ${ACTIVE_SLOT}"
-      return 0
+  mkdir -p "${LOG_DIR}"
+  touch "${LOG_DIR}/nginx-sync.log"
+
+  # ── Step 1 & 2: Evaluate each backend (stable + nginx reachable) ──────────
+  log_info "Probing blue backend health..."
+  if backend_is_usable blue; then blue_usable=true; fi
+
+  log_info "Probing green backend health..."
+  if backend_is_usable green; then green_usable=true; fi
+
+  # ── Step 5: Guard against premature maintenance (2s double-check) ─────────
+  if [ "${blue_usable}" = "false" ] && [ "${green_usable}" = "false" ]; then
+    log_warn "Both backends unresponsive. Waiting 2s before confirming maintenance..."
+    sleep 2
+    log_info "Re-probing blue backend..."
+    if backend_is_usable blue; then blue_usable=true; fi
+    log_info "Re-probing green backend..."
+    if backend_is_usable green; then green_usable=true; fi
+  fi
+
+  # ── Determine current nginx backend from live config ──────────────────────
+  local CURRENT_MOUNTED
+  CURRENT_MOUNTED="$(grep -oE 'http://(api-blue|api-green):' "${OUTPUT_FILE}" 2>/dev/null \
+    | grep -oE 'api-blue|api-green' | head -1 | sed 's/^api-//' || true)"
+
+  # Telemetry shorthand
+  local blue_status green_status
+  blue_status="$( [ "${blue_usable}" = "true" ] && echo "stable" || echo "unstable" )"
+  green_status="$( [ "${green_usable}" = "true" ] && echo "stable" || echo "unstable" )"
+
+  local healthy=""
+  [ "${blue_usable}" = "true" ]  && healthy="blue"
+  [ "${green_usable}" = "true" ] && healthy="${healthy:+${healthy} }green"
+  HEALTHY_CONTAINERS="${healthy}"
+
+  # ── Step 3/4: Decision logic (FINAL ORDER — must not change) ─────────────
+  #
+  # Priority:
+  #   1. Both valid  → keep current backend (no-op) if current is still valid,
+  #                    else switch to other valid backend.
+  #   2. One valid   → use that backend.
+  #   3. None valid  → maintenance (already double-checked above).
+
+  if [ "${blue_usable}" = "true" ] && [ "${green_usable}" = "true" ]; then
+    # BOTH healthy — only switch if current backend is no longer valid.
+    if is_valid_slot "${CURRENT_MOUNTED}" && backend_is_usable "${CURRENT_MOUNTED}"; then
+      ACTIVE_SLOT="${CURRENT_MOUNTED}"
+      ACTIVE_SLOT_SOURCE="current-backend-guard"
+      ACTIVE_SLOT_ACTION="NO-OP"
+      log_ok "Both backends healthy. Current backend '${CURRENT_MOUNTED}' still valid — keeping it."
+    else
+      # Current backend is gone/unknown — pick the other valid one.
+      # Prefer blue as the tiebreaker when current is unknown.
+      if [ "${CURRENT_MOUNTED}" = "green" ]; then
+        ACTIVE_SLOT="blue"
+      else
+        ACTIVE_SLOT="green"
+      fi
+      ACTIVE_SLOT_SOURCE="both-healthy-switch"
+      ACTIVE_SLOT_ACTION="SWITCH"
+      log_warn "Both backends healthy but current '${CURRENT_MOUNTED}' invalid — switching to '${ACTIVE_SLOT}'."
     fi
 
-    log_warn "Invalid active-slot override '${ACTIVE_SLOT_OVERRIDE}'. Attempting recovery."
-  elif [ -f "${ACTIVE_SLOT_FILE}" ]; then
-    candidate="$(tr -d '[:space:]' < "${ACTIVE_SLOT_FILE}")"
-    if is_valid_slot "${candidate}"; then
-      ACTIVE_SLOT="${candidate}"
-      ACTIVE_SLOT_SOURCE="slot-file"
-      log_info "Active slot (from ${ACTIVE_SLOT_FILE}): ${ACTIVE_SLOT}"
-      return 0
-    fi
+  elif [ "${blue_usable}" = "true" ]; then
+    ACTIVE_SLOT="blue"
+    ACTIVE_SLOT_SOURCE="health-primary"
+    ACTIVE_SLOT_ACTION="$( [ "${CURRENT_MOUNTED}" = "blue" ] && echo "NO-OP" || echo "SWITCH" )"
 
-    log_warn "Invalid active slot '${candidate}' in ${ACTIVE_SLOT_FILE}. Attempting recovery."
+  elif [ "${green_usable}" = "true" ]; then
+    ACTIVE_SLOT="green"
+    ACTIVE_SLOT_SOURCE="health-primary"
+    ACTIVE_SLOT_ACTION="$( [ "${CURRENT_MOUNTED}" = "green" ] && echo "NO-OP" || echo "SWITCH" )"
+
   else
-    log_warn "${ACTIVE_SLOT_FILE} not found. Attempting recovery."
+    ACTIVE_SLOT="none"
+    ACTIVE_SLOT_SOURCE="health-primary"
+    ACTIVE_SLOT_ACTION="SWITCH"
   fi
 
-  if [ -f "${SLOT_BACKUP_FILE}" ]; then
-    candidate="$(tr -d '[:space:]' < "${SLOT_BACKUP_FILE}")"
-    if is_valid_slot "${candidate}"; then
-      ACTIVE_SLOT="${candidate}"
-      ACTIVE_SLOT_SOURCE="slot-backup"
-      RECOVERED_SLOT=true
-      log_info "Recovered active slot from ${SLOT_BACKUP_FILE}: ${ACTIVE_SLOT}"
-      return 0
-    fi
-  fi
-
-  candidate="$(read_slot_from_last_good)"
-  if is_valid_slot "${candidate}"; then
-    ACTIVE_SLOT="${candidate}"
-    ACTIVE_SLOT_SOURCE="last-good"
-    RECOVERED_SLOT=true
-    log_info "Recovered active slot from ${LAST_GOOD_FILE}: ${ACTIVE_SLOT}"
-    return 0
-  fi
-
-  candidate="$(read_slot_from_live_config)"
-  if is_valid_slot "${candidate}"; then
-    ACTIVE_SLOT="${candidate}"
-    ACTIVE_SLOT_SOURCE="live-config"
-    RECOVERED_SLOT=true
-    log_info "Recovered active slot from live nginx config: ${ACTIVE_SLOT}"
-    return 0
-  fi
-
-  candidate="$(discover_slot_from_backends)"
-  if is_valid_slot "${candidate}"; then
-    ACTIVE_SLOT="${candidate}"
-    ACTIVE_SLOT_SOURCE="backend-discovery"
-    RECOVERED_SLOT=true
-    log_info "Recovered active slot from healthy backend discovery: ${ACTIVE_SLOT}"
-    return 0
-  fi
-
-  ACTIVE_SLOT="blue"
-  ACTIVE_SLOT_SOURCE="default"
-  RECOVERED_SLOT=true
-  log_warn "No valid slot metadata or healthy backend was found. Defaulting slot to 'blue' and switching nginx to maintenance mode."
+  # ── Structured run summary log ────────────────────────────────────────────
+  printf '%s | blue=%s | green=%s | blue_nginx_reach=%s | green_nginx_reach=%s | current=%s | selected=%s | source=%s | action=%s | mode=%s\n' \
+    "$(date -u +%FT%TZ)" \
+    "${blue_status}" \
+    "${green_status}" \
+    "${blue_usable}" \
+    "${green_usable}" \
+    "${CURRENT_MOUNTED:-none}" \
+    "${ACTIVE_SLOT}" \
+    "${ACTIVE_SLOT_SOURCE}" \
+    "${ACTIVE_SLOT_ACTION}" \
+    "$( [ "${ACTIVE_SLOT}" = "none" ] && echo "maintenance" || echo "active" )" \
+    >> "${LOG_DIR}/nginx-sync.log" || true
 }
 
 select_routing_target() {
-  local preferred_slot="$1"
-  local alternate_slot
-
-  if backend_is_usable "${preferred_slot}"; then
-    SELECTED_SLOT="${preferred_slot}"
-    SELECTED_CONTAINER="api-${SELECTED_SLOT}"
-    FALLBACK_USED=false
-    log_info "Validated preferred backend ${SELECTED_CONTAINER} (healthy on api_network)"
-    return 0
+  if [ "${ACTIVE_SLOT}" = "none" ]; then
+    return 1 # Maintenance mode
   fi
 
-  alternate_slot="$(other_slot "${preferred_slot}")"
-  if backend_is_usable "${alternate_slot}"; then
-    SELECTED_SLOT="${alternate_slot}"
-    SELECTED_CONTAINER="api-${SELECTED_SLOT}"
-    FALLBACK_USED=true
-    log_info "Preferred slot '${preferred_slot}' is stale or unhealthy."
-    log_info "Falling back to healthy slot '${SELECTED_SLOT}' (${SELECTED_CONTAINER})"
-    return 0
-  fi
-
-  return 1
+  SELECTED_SLOT="${ACTIVE_SLOT}"
+  SELECTED_CONTAINER="api-${SELECTED_SLOT}"
+  FALLBACK_USED=false
+  log_info "Selected backend ${SELECTED_CONTAINER} via ${ACTIVE_SLOT_SOURCE}"
+  return 0
 }
 
 mkdir -p "${STATE_DIR}" "${LIVE_DIR}" "${BACKUP_DIR}"
@@ -477,12 +478,12 @@ if select_routing_target "${ACTIVE_SLOT}"; then
 else
   ROUTING_MODE="maintenance"
   TARGET_TEMPLATE="${MAINTENANCE_TEMPLATE_FILE}"
-  SELECTED_SLOT="${ACTIVE_SLOT}"
-  SELECTED_CONTAINER="api-${SELECTED_SLOT}"
+  SELECTED_SLOT="maintenance"
+  SELECTED_CONTAINER="none"
   if [ "${ALLOW_MISSING_BACKEND}" = "true" ]; then
-    log_info "No healthy backend slot was found — rendering maintenance config instead"
+    log_info "No healthy backend found — rendering maintenance config"
   else
-    log_warn "No healthy backend slot was found — switching nginx to maintenance mode"
+    log_warn "No healthy backend found — switching nginx to maintenance mode"
   fi
 fi
 
@@ -493,6 +494,23 @@ cleanup() {
 trap cleanup EXIT
 
 render_template "${TARGET_TEMPLATE}" "${TEMP_CONF_DIR}/api.conf"
+
+# ================================================================
+# Idempotency guard — skip all config writing if already matches
+# ================================================================
+if [ -f "${OUTPUT_FILE}" ]; then
+  if diff -q "${TEMP_CONF_DIR}/api.conf" "${OUTPUT_FILE}" >/dev/null 2>&1; then
+    # Config on disk already matches what we would write. Only proceed if
+    # nginx is missing or /infra/health is broken.
+    if docker ps -q --filter "name=^nginx$" | grep -q . \
+       && curl -fsS -o /dev/null -w "%{http_code}" http://localhost/infra/health 2>/dev/null | grep -q '200'; then
+      log_ok "[NO-OP] Rendered config identical to disk and nginx is healthy. Nothing to do."
+      printf '%s | action=NO-OP | reason=config-identical\n' "$(date -u +%FT%TZ)" >> "${LOG_DIR}/nginx-sync.log" || true
+      exit 0
+    fi
+    log_warn "Config identical to disk but nginx is unhealthy — reloading anyway."
+  fi
+fi
 
 # CRITICAL: Validate config matches expected mode
 log_info "Validating rendered config matches mode: ${ROUTING_MODE}"
@@ -507,7 +525,7 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   log_ok "Maintenance config validated: no proxy directives"
   
   # Verify maintenance config returns 503 for /health
-  if ! grep -A 2 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return 503"; then
+  if ! grep -A 5 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return 503"; then
     log_error "CRITICAL: Maintenance /health does not return 503"
     log_error "Maintenance mode MUST return 503 for /health to signal unhealthy state"
     exit 1
@@ -563,11 +581,30 @@ cp "${TEMP_CONF_DIR}/api.conf" "${OUTPUT_FILE}"
 log_ok "Config rendered -> ${OUTPUT_FILE}"
 
 if docker ps --format '{{.Names}}' | grep -qx 'nginx'; then
-  log_info "Reloading nginx..."
+  log_info "Safely reloading nginx..."
+  RELOAD_FAILED=false
   if ! docker exec nginx nginx -s reload >/dev/null; then
-    log_error "nginx reload failed. Rolling back..."
-    rollback_live_config
-    exit 1
+    log_warn "Standard nginx reload failed or exit non-zero."
+    RELOAD_FAILED=true
+  fi
+  sleep 1
+
+  # Check config drift
+  log_info "Validating runtime config consistency..."
+  RUNTIME_CONFIG="$(docker exec nginx cat /etc/nginx/conf.d/api.conf 2>/dev/null || true)"
+  DISK_CONFIG="$(cat "${OUTPUT_FILE}")"
+
+  # Verify deterministic nginx mount
+  MOUNT_PATH="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/nginx/conf.d"}}{{.Source}}{{end}}{{end}}' nginx 2>/dev/null || true)"
+  if [[ "${MOUNT_PATH}" != *"/nginx/live" ]]; then
+    log_error "CRITICAL: Nginx mount path is incorrect: ${MOUNT_PATH}"
+    RELOAD_FAILED=true
+  fi
+
+  if [ "${RUNTIME_CONFIG}" != "${DISK_CONFIG}" ] || [ "${RELOAD_FAILED}" = "true" ]; then
+    log_warn "Config drift or reload failure detected! Restarting nginx container (Self-Healing)..."
+    docker compose -f "${NGINX_COMPOSE_FILE}" up -d --force-recreate nginx >/dev/null
+    sleep 2
   fi
 else
   log_info "Starting nginx..."
@@ -592,62 +629,69 @@ if [ "${INFRA_HEALTH_CODE}" != "200" ]; then
 fi
 log_ok "/infra/health correctly returns 200 (nginx is alive)"
 
-if [ "${ROUTING_MODE}" = "maintenance" ]; then
-  # In maintenance mode, /health should return 503
-  HEALTH_CODE="$(docker exec nginx sh -c "wget -q -O /dev/null -S http://127.0.0.1/health 2>&1 | grep 'HTTP/' | awk '{print \$2}'" || echo "000")"
-  if [ "${HEALTH_CODE}" = "502" ]; then
-    log_error "CRITICAL: Maintenance /health returned 502 (backend resolution failure)"
-    log_error "This means nginx is trying to proxy to backends that don't exist"
-    rollback_live_config
-    exit 1
-  elif [ "${HEALTH_CODE}" = "503" ]; then
-    log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
-  elif [ "${HEALTH_CODE}" = "200" ]; then
-    log_error "CRITICAL: Maintenance /health returned 200 (should be 503)"
-    log_error "This masks the fact that no backend is available"
-    rollback_live_config
-    exit 1
-  else
-    log_warn "Maintenance /health returned unexpected code: ${HEALTH_CODE} (expected 503)"
+  # Wait until system stabilizes
+  log_info "Waiting for system validation to stabilize (max 30s)..."
+  CONVERGED=false
+  for i in $(seq 1 30); do
+    MATCH=true
+    
+    if [ "${ROUTING_MODE}" = "maintenance" ]; then
+      HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" -H "Host: ${API_HOSTNAME}" http://localhost/health || echo "000")"
+      HEALTH_BODY="$(curl -s -H "Host: ${API_HOSTNAME}" http://localhost/health 2>/dev/null || echo "")"
+      if [ "${HEALTH_CODE}" != "503" ] || ! echo "${HEALTH_BODY}" | grep -q "maintenance"; then
+        MATCH=false
+      fi
+    else
+      if ! probe_route_through_nginx >/dev/null 2>&1; then
+        MATCH=false
+      else
+        ACTIVE_HEALTH_BODY="$(curl -s -H "Host: ${API_HOSTNAME}" http://localhost/health 2>/dev/null || echo "")"
+        if echo "${ACTIVE_HEALTH_BODY}" | grep -q "maintenance"; then
+          MATCH=false
+        fi
+      fi
+    fi
+
+    if [ "${MATCH}" = "true" ]; then
+      log_ok "System converged at iteration ${i}."
+      CONVERGED=true
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "${CONVERGED}" = "false" ]; then
+    log_warn "--- DRIFT TELEMETRY ---"
+    log_warn "Active Slot Target: ${ACTIVE_SLOT}"
+    log_warn "Healthy Detected: ${HEALTHY_CONTAINERS}"
+    log_warn "Routing Mode Set: ${ROUTING_MODE}"
+    if [ "${ROUTING_MODE}" = "active" ]; then
+      log_warn "Last Curl Out: ${ACTIVE_HEALTH_BODY}"
+    else
+      log_warn "Last Curl Out (Code ${HEALTH_CODE}): ${HEALTH_BODY}"
+    fi
+    log_warn "-----------------------"
+    
+    export NGINX_SYNC_RETRY=$(( ${NGINX_SYNC_RETRY:-0} + 1 ))
+    if [ "${NGINX_SYNC_RETRY}" -le 1 ]; then
+      log_warn "Convergence timed out. Retrying nginx-sync once (attempt ${NGINX_SYNC_RETRY}/1)..."
+      exec bash "$0" "${ORIGINAL_ARGS[@]:-}"
+    else
+      log_error "CRITICAL: Convergence failed after retry. Rolling back."
+      rollback_live_config
+      exit 1
+    fi
   fi
   
-  # Verify response contains "maintenance"
-  HEALTH_BODY="$(docker exec nginx sh -c "wget -q -O - http://127.0.0.1/health 2>/dev/null" || echo "")"
-  if ! echo "${HEALTH_BODY}" | grep -q "maintenance"; then
-    log_error "CRITICAL: Maintenance /health response does not contain 'maintenance'"
-    log_error "Response: ${HEALTH_BODY}"
-    rollback_live_config
-    exit 1
+  if [ "${ROUTING_MODE}" = "active" ]; then
+    log_info "Running routed /ready probe through nginx (non-gating)..."
+    if run_probe_with_retries "Routed /ready probe through nginx" probe_ready_through_nginx; then
+      log_ok "Routed /ready probe passed"
+    else
+      log_info "Routed /ready probe did not pass; continuing because /ready is informational here"
+    fi
+    heal_slot_file_if_needed
   fi
-  log_ok "Maintenance /health response correctly indicates maintenance mode"
-fi
-
-if [ "${ROUTING_MODE}" = "active" ]; then
-  log_info "Running routed /health probe through nginx..."
-  if ! run_probe_with_retries "Routed /health probe through nginx" probe_route_through_nginx; then
-    log_error "End-to-end nginx probe failed. Rolling back..."
-    rollback_live_config
-    exit 1
-  fi
-  log_ok "Routed /health probe passed"
-
-  log_info "Running routed /ready probe through nginx (non-gating)..."
-  if run_probe_with_retries "Routed /ready probe through nginx" probe_ready_through_nginx; then
-    log_ok "Routed /ready probe passed"
-  else
-    log_info "Routed /ready probe did not pass; continuing because /ready is informational here"
-  fi
-
-  heal_slot_file_if_needed
-else
-  log_info "Running nginx liveness probe in maintenance mode..."
-  if ! probe_nginx_liveness; then
-    log_error "Maintenance-mode nginx probe failed. Rolling back..."
-    rollback_live_config
-    exit 1
-  fi
-  log_ok "Maintenance-mode nginx probe passed"
-fi
 
 log_ok "nginx-sync complete - mode: ${ROUTING_MODE}, slot_source: ${ACTIVE_SLOT_SOURCE}, requested slot: ${ACTIVE_SLOT}, routed slot: ${SELECTED_SLOT}, container: ${SELECTED_CONTAINER}"
 
