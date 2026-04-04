@@ -15,8 +15,24 @@ log_ok()    { printf '[check-contract] OK    %s\n' "$*"; }
 assert_absent() {
   local description="$1"
   local pattern="$2"
+  # Scope: scripts/*.sh only — README, docs, and workflows are not subject to
+  # these naming-contract rules.
+  if grep -n --binary-files=without-match -E "$pattern" scripts/*.sh; then
+    log_error "Found forbidden ${description}"
+    exit 1
+  fi
+}
 
-  if grep -RIn --binary-files=without-match -E "$pattern" .; then
+# assert_absent_except <description> <pattern> <exclusion-regex>
+# Like assert_absent but ignores lines matching exclusion-regex.
+# Used for paths that are legitimately defined in one place (e.g., bootstrap.sh
+# declares the VPS default; no other script may use it as a bare path).
+assert_absent_except() {
+  local description="$1"
+  local pattern="$2"
+  local exclusion="$3"
+  if grep -n --binary-files=without-match -E "$pattern" scripts/*.sh \
+       | grep -vE "$exclusion"; then
     log_error "Found forbidden ${description}"
     exit 1
   fi
@@ -64,15 +80,44 @@ assert_contains "docker-compose.monitoring.yml" "external: true"
 log_ok "Compose files use external api_network"
 
 log_info "Checking script contract..."
+# Ensure scripts reference canonical network and follow contract
 assert_contains "scripts/bootstrap.sh" "api_network"
+
+# Detect hardcoded canonical paths in scripts/*.sh.
+# The ONLY permitted occurrences are:
+#   - bootstrap.sh: defines STATE_DIR, LOG_DIR, and EXPECTED_INFRA_ROOT as VPS defaults
+#   - nginx-sync.sh: uses ${VAR:-default} env-override syntax for all three paths
+# All other scripts must reference ${INFRA_ROOT}, ${LOG_DIR}, ${STATE_DIR} — never bare paths.
+assert_absent_except "hardcoded canonical infra path" \
+  "/opt/infra" \
+  "(INFRA_ROOT.*:-/opt/infra|EXPECTED_INFRA_ROOT=['\"/]*/opt/infra)"
+assert_absent_except "hardcoded fieldtrack log path" \
+  "/var/log/fieldtrack" \
+  "LOG_DIR.*=.*[-:\"']/var/log/fieldtrack"
+assert_absent_except "hardcoded fieldtrack state path" \
+  "/var/lib/fieldtrack" \
+  "STATE_DIR.*=.*[-:\"']/var/lib/fieldtrack"
+
+# bootstrap.sh MUST define the canonical VPS state default explicitly.
 assert_contains "scripts/bootstrap.sh" "STATE_DIR=\"/var/lib/fieldtrack\""
+
+# Guard against legacy slot-file usage in nginx-sync (slot-based routing removed).
 if grep -Fq "active-slot" "scripts/nginx-sync.sh"; then
   log_error "scripts/nginx-sync.sh must not reference active-slot (slot-based routing was removed)"
   exit 1
 fi
 log_ok "nginx-sync.sh contains no legacy slot-file references"
+
+# Ensure monitoring script references the expected compose manifest.
 assert_contains "scripts/monitoring-sync.sh" "docker-compose.monitoring.yml"
 log_ok "Scripts match the shared infra contract"
+
+# Ensure runtime nginx directories are present in the repo layout (keeps git clone deterministic).
+# These .gitkeep files guarantee the directory layout is present after clone.
+log_info "Ensuring runtime nginx directories are tracked"
+assert_file_exists "nginx/live/.gitkeep"
+assert_file_exists "nginx/backup/.gitkeep"
+log_ok "Runtime nginx directories are present and tracked"
 
 log_info "Checking monitoring targets..."
 assert_contains "docker-compose.monitoring.yml" "REDIS_ADDR=redis:6379"

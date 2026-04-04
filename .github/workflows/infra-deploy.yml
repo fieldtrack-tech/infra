@@ -159,6 +159,9 @@ jobs:
       - name: Bootstrap core infra
         env:
           API_HOSTNAME: api.test.local
+          INFRA_ROOT: ${{ github.workspace }}
+          LOG_DIR: /tmp/fieldtrack/log
+          STATE_DIR: /tmp/fieldtrack/state
         run: bash scripts/bootstrap.sh
 
       - name: Verify Redis readiness
@@ -203,11 +206,12 @@ jobs:
             -v /tmp/mock-api.conf:/etc/nginx/conf.d/default.conf:ro \
             nginx:1.25-alpine >/dev/null
 
-          echo blue | sudo tee /var/lib/fieldtrack/active-slot >/dev/null
-
       - name: Sync nginx to healthy backend
         env:
           API_HOSTNAME: api.test.local
+          INFRA_ROOT: ${{ github.workspace }}
+          LOG_DIR: /tmp/fieldtrack/log
+          STATE_DIR: /tmp/fieldtrack/state
         run: bash scripts/nginx-sync.sh
 
       - name: Verify routed API health
@@ -263,29 +267,37 @@ jobs:
       - name: Verify stale slot falls back to healthy alternate
         env:
           API_HOSTNAME: api.test.local
+          INFRA_ROOT: ${{ github.workspace }}
+          LOG_DIR: /tmp/fieldtrack/log
+          STATE_DIR: /tmp/fieldtrack/state
         run: |
           docker stop api-blue
-          bash scripts/nginx-sync.sh --active-slot blue
+          bash scripts/nginx-sync.sh
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-green'
 
       - name: Verify corrupt slot recovers to healthy backend
         env:
           API_HOSTNAME: api.test.local
+          INFRA_ROOT: ${{ github.workspace }}
+          LOG_DIR: /tmp/fieldtrack/log
+          STATE_DIR: /tmp/fieldtrack/state
         run: |
-          printf 'invalid\n' >/var/lib/fieldtrack/active-slot
           bash scripts/nginx-sync.sh
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-green'
 
       - name: Ensure dead backends fall back to maintenance mode
         env:
           API_HOSTNAME: api.test.local
+          INFRA_ROOT: ${{ github.workspace }}
+          LOG_DIR: /tmp/fieldtrack/log
+          STATE_DIR: /tmp/fieldtrack/state
         run: |
           echo "=== Stopping api-green ==="
           docker stop api-green
 
           echo "=== Running nginx-sync with debug ==="
           set +e
-          bash scripts/nginx-sync.sh --active-slot blue
+          bash scripts/nginx-sync.sh
           EXIT_CODE=$?
           echo "=== nginx-sync EXIT CODE: ${EXIT_CODE} ==="
 
@@ -417,7 +429,6 @@ jobs:
 
             echo "[deploy] Deterministic execution controller waiting for convergence limits..."
             validate_state() {
-              local VALIDATED=0
               for i in {1..10}; do
                  INFRA_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/infra/health || echo "000")"
                  HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health || echo "000")"
@@ -426,12 +437,18 @@ jobs:
                  MATCH=1
                  if [ "${INFRA_CODE}" != "200" ]; then MATCH=0; fi
 
-                 if [ ! -f /var/lib/fieldtrack/active-slot ] || ! grep -qwE "(blue|green)" /var/lib/fieldtrack/active-slot; then
-                   if [ "${HEALTH_CODE}" != "503" ] || ! echo "${HEALTH_BODY}" | grep -q 'maintenance'; then MATCH=0; fi
+                 # Use container presence (not slot file) to determine expected mode.
+                 # Slot-file routing was removed; health-based routing is canonical.
+                 if docker ps --format '{{.Names}}' | grep -qE '^api-(blue|green)$'; then
+                   # At least one API container is running: active mode expected.
+                   if [ "${HEALTH_CODE}" != "200" ] || echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
+                     MATCH=0
+                   fi
                  else
-                   if echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
-                     if [ "${HEALTH_CODE}" != "503" ]; then MATCH=0; fi
-                   elif [ "${HEALTH_CODE}" != "200" ]; then MATCH=0; fi
+                   # No API containers running: maintenance mode expected.
+                   if [ "${HEALTH_CODE}" != "503" ] || ! echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
+                     MATCH=0
+                   fi
                  fi
 
                  if [ "${MATCH}" -eq 1 ]; then

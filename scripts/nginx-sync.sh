@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-INFRA_ROOT="/opt/infra"
+INFRA_ROOT="${INFRA_ROOT:-/opt/infra}"
 # Allow bootstrap (CI or VPS) to export alternate paths via environment.
 # Canonical VPS defaults are used when not overridden.
 STATE_DIR="${STATE_DIR:-/var/lib/fieldtrack}"
@@ -44,6 +44,50 @@ log_info()  { printf '[nginx-sync] INFO  %s\n' "$*"; }
 log_warn()  { printf '[nginx-sync] WARN  %s\n' "$*" >&2; }
 log_error() { printf '[nginx-sync] ERROR %s\n' "$*" >&2; }
 log_ok()    { printf '[nginx-sync] OK    %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Preflight checks — fail fast and loudly if the infra contract is incomplete
+# ---------------------------------------------------------------------------
+# These checks are intentionally strict: nginx-sync must only consume infra
+# that bootstrap prepared. It must never create or mutate runtime dirs.
+preflight_checks() {
+  local missing=0
+  local f d
+
+  # Required template + compose files
+  for f in "${TEMPLATE_FILE}" "${MAINTENANCE_TEMPLATE_FILE}" "${NGINX_COMPOSE_FILE}"; do
+    if [ ! -f "${f}" ]; then
+      printf '[nginx-sync] ERROR Required file missing: %s\n' "${f}" >&2
+      missing=$((missing+1))
+    fi
+  done
+
+  # Required runtime directories MUST exist (created by bootstrap)
+  for d in "${LIVE_DIR}" "${BACKUP_DIR}"; do
+    if [ ! -d "${d}" ]; then
+      printf '[nginx-sync] ERROR Required directory missing: %s\n' "${d}" >&2
+      missing=$((missing+1))
+    fi
+  done
+
+  # Ensure LOG_DIR and STATE_DIR are present and writable (bootstrap guarantees)
+  if [[ -z "${LOG_DIR:-}" || ! -w "${LOG_DIR}" ]]; then
+    printf '[nginx-sync] ERROR LOG_DIR not writable or unset: %s\n' "${LOG_DIR:-<unset>}" >&2
+    missing=$((missing+1))
+  fi
+  if [[ -z "${STATE_DIR:-}" || ! -w "${STATE_DIR}" ]]; then
+    printf '[nginx-sync] ERROR STATE_DIR not writable or unset: %s\n' "${STATE_DIR:-<unset>}" >&2
+    missing=$((missing+1))
+  fi
+
+  if [ "${missing}" -gt 0 ]; then
+    printf '[nginx-sync] ERROR Preflight checks failed for INFRA_ROOT=%s — aborting\n' "${INFRA_ROOT}" >&2
+    exit 1
+  fi
+}
+
+# Run preflight immediately after helper logging funcs are defined
+preflight_checks
 
 ALLOW_MISSING_BACKEND=false
 ACTIVE_SLOT=""
@@ -412,15 +456,9 @@ select_routing_target() {
   return 0
 }
 
-# STATE_DIR and nginx/live+backup must be writable — bootstrap guarantees this.
-# Attempt fallback creation in case nginx-sync is run standalone.
-for _dir in "${STATE_DIR}" "${LIVE_DIR}" "${BACKUP_DIR}"; do
-  if [ ! -d "${_dir}" ]; then
-    mkdir -p "${_dir}" 2>/dev/null || { log_error "${_dir} does not exist and cannot be created. Run bootstrap first."; exit 1; }
-  fi
-done
-unset _dir
-
+# STATE_DIR, LIVE_DIR, and BACKUP_DIR are guaranteed by bootstrap.sh.
+# nginx-sync must NOT create infra — only validate and operate.
+# A failed preflight above would have already exited if any of these were missing.
 
 resolve_active_slot
 
