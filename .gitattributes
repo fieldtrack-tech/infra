@@ -1,0 +1,13 @@
+# Enforce Unix line endings (LF) for all text files
+* text=auto eol=lf
+
+# Explicitly enforce LF for YAML configs
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Shell scripts must be LF
+*.sh text eol=lf
+
+# Windows batch files keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
