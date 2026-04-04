@@ -197,6 +197,7 @@ The API's `.env` file is **not used** by this repository.
 | `scripts/validate-docker-cli.sh` | Validates Docker CLI commands use correct --entrypoint flags |
 | `scripts/validate-secrets.sh` | Validates environment variables and secrets configuration |
 | `scripts/validate-paths.sh` | Validates infra repository path setup and required directories |
+| `scripts/validate-nginx-configs.sh` | Validates nginx configs (ensures maintenance mode has no proxy directives) |
 
 All scripts validate they're running from `/opt/infra` on production and log warnings if not.
 

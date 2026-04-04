@@ -30,6 +30,9 @@ jobs:
       - name: Validate path setup
         run: bash scripts/validate-paths.sh
 
+      - name: Validate nginx configs
+        run: bash scripts/validate-nginx-configs.sh
+
       - name: Install validation tools
         run: |
           python -m pip install --upgrade pip
