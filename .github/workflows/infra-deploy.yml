@@ -21,12 +21,38 @@ jobs:
       - name: Enforce infra contract
         run: bash scripts/check-contract.sh
 
+      - name: Guard against incorrect Docker CLI usage
+        run: bash scripts/validate-docker-cli.sh
+
+      - name: Validate secrets configuration
+        run: bash scripts/validate-secrets.sh
+
       - name: Install validation tools
         run: |
           python -m pip install --upgrade pip
           pip install yamllint
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck gettext-base -qq
+
+      - name: Validate required environment variables
+        run: |
+          echo "Validating .env.monitoring.example contains all required variables..."
+          REQUIRED_VARS=("API_HOSTNAME" "GRAFANA_ADMIN_PASSWORD" "METRICS_SCRAPE_TOKEN" "ALERTMANAGER_SLACK_WEBHOOK")
+          MISSING_VARS=()
+          
+          for var in "${REQUIRED_VARS[@]}"; do
+            if ! grep -q "^${var}=" .env.monitoring.example; then
+              MISSING_VARS+=("${var}")
+            fi
+          done
+          
+          if [ ${#MISSING_VARS[@]} -gt 0 ]; then
+            echo "ERROR: Missing required variables in .env.monitoring.example:"
+            printf '  - %s\n' "${MISSING_VARS[@]}"
+            exit 1
+          fi
+          
+          echo "All required variables present in .env.monitoring.example"
 
       - name: Prepare monitoring env and rendered config
         run: |
@@ -35,6 +61,17 @@ jobs:
           sed -i 's/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=ci-grafana-password/' .env.monitoring
           sed -i 's/^METRICS_SCRAPE_TOKEN=.*/METRICS_SCRAPE_TOKEN=ci-metrics-token/' .env.monitoring
           sed -i 's#^ALERTMANAGER_SLACK_WEBHOOK=.*#ALERTMANAGER_SLACK_WEBHOOK=https://hooks.slack.com/services/T00000000/B00000000/CIWEBHOOK#' .env.monitoring
+          
+          # Validate all required variables are set
+          set -a
+          source .env.monitoring
+          set +a
+          
+          : "${API_HOSTNAME:?API_HOSTNAME is required}"
+          : "${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}"
+          : "${METRICS_SCRAPE_TOKEN:?METRICS_SCRAPE_TOKEN is required}"
+          : "${ALERTMANAGER_SLACK_WEBHOOK:?ALERTMANAGER_SLACK_WEBHOOK is required}"
+          
           bash scripts/render-prometheus.sh
           bash scripts/render-alertmanager.sh
 
@@ -61,12 +98,12 @@ jobs:
 
       - name: Validate Prometheus and Alertmanager configs
         run: |
-          docker run --rm -v "${PWD}:/workspace" -w /workspace prom/prometheus:v2.52.0 \
-            promtool check config prometheus/prometheus.rendered.yml
-          docker run --rm -v "${PWD}:/workspace" -w /workspace prom/prometheus:v2.52.0 \
-            promtool check rules prometheus/alerts.yml
-          docker run --rm -v "${PWD}:/workspace" -w /workspace prom/alertmanager:v0.27.0 \
-            amtool check-config alertmanager/alertmanager.rendered.yml
+          docker run --rm -v "${PWD}:/workspace" -w /workspace --entrypoint promtool prom/prometheus:v2.52.0 \
+            check config prometheus/prometheus.rendered.yml
+          docker run --rm -v "${PWD}:/workspace" -w /workspace --entrypoint promtool prom/prometheus:v2.52.0 \
+            check rules prometheus/alerts.yml
+          docker run --rm -v "${PWD}:/workspace" -w /workspace --entrypoint amtool prom/alertmanager:v0.27.0 \
+            check-config alertmanager/alertmanager.rendered.yml
 
       - name: Shellcheck scripts
         run: |
@@ -223,6 +260,25 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate required GitHub secrets
+        run: |
+          echo "Validating required GitHub secrets are configured..."
+          MISSING_SECRETS=()
+          
+          [ -z "${{ secrets.VPS_HOST }}" ] && MISSING_SECRETS+=("VPS_HOST")
+          [ -z "${{ secrets.VPS_USER }}" ] && MISSING_SECRETS+=("VPS_USER")
+          [ -z "${{ secrets.VPS_SSH_KEY }}" ] && MISSING_SECRETS+=("VPS_SSH_KEY")
+          
+          if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
+            echo "ERROR: Missing required GitHub secrets:"
+            printf '  - %s\n' "${MISSING_SECRETS[@]}"
+            echo ""
+            echo "Configure these in: Settings > Secrets and variables > Actions > Repository secrets"
+            exit 1
+          fi
+          
+          echo "All required GitHub secrets are configured"
 
       - name: Deploy infra via SSH
         uses: appleboy/ssh-action@v1.0.3

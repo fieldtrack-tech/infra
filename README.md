@@ -178,6 +178,8 @@ The API's `.env` file is **not used** by this repository.
 | `scripts/render-prometheus.sh` | Renders `prometheus.yml` template into `prometheus.rendered.yml` |
 | `scripts/render-alertmanager.sh` | Renders `alertmanager.yml` template into `alertmanager.rendered.yml` |
 | `scripts/verify-alertmanager.sh` | Smoke-tests Alertmanager health and routing after a config change |
+| `scripts/validate-docker-cli.sh` | Validates Docker CLI commands use correct --entrypoint flags |
+| `scripts/validate-secrets.sh` | Validates environment variables and secrets configuration |
 
 ---
 
