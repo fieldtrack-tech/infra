@@ -37,16 +37,11 @@ if [ ! -d "${EXPECTED_INFRA_ROOT}/.git" ]; then
   git clone https://github.com/fieldtrack-tech/infra.git "${EXPECTED_INFRA_ROOT}"
 fi
 
-if [ ! -f "${INFRA_DIR}/.env.monitoring" ]; then
-  echo "[bootstrap] ERROR .env.monitoring is missing in ${INFRA_DIR}. Cannot proceed." >&2
-  exit 1
-fi
+# .env.monitoring is sourced later only when --with-monitoring is passed.
+# Core infra (Redis + nginx) does not require it.
 
-set -a
-source "${INFRA_DIR}/.env.monitoring"
-set +a
 STATE_DIR="/var/lib/fieldtrack"
-ACTIVE_SLOT_FILE="${STATE_DIR}/active-slot"
+
 
 WITH_MONITORING=false
 for arg in "$@"; do
@@ -122,19 +117,6 @@ for dir in "${REQUIRED_DIRS[@]}"; do
 done
 log_ok "All required directories exist"
 
-# ---------------------------------------------------------------------------
-# Initialize state files if missing
-# ---------------------------------------------------------------------------
-log_info "Initializing state files..."
-
-if [ ! -f "${ACTIVE_SLOT_FILE}" ]; then
-  log_info "Creating initial active-slot file: blue"
-  printf 'blue\n' > "${ACTIVE_SLOT_FILE}"
-  log_ok "Active slot initialized to 'blue'"
-else
-  CURRENT_SLOT="$(cat "${ACTIVE_SLOT_FILE}" 2>/dev/null | tr -d '[:space:]')"
-  log_info "Active slot file exists: ${CURRENT_SLOT}"
-fi
 
 install_nginx_watchdog() {
   local watchdog_tag="fieldtrack-nginx-watchdog"
@@ -202,18 +184,6 @@ wait_for_nginx() {
   return 1
 }
 
-resolve_bootstrap_slot() {
-  if [ -f "${ACTIVE_SLOT_FILE}" ]; then
-    case "$(tr -d '[:space:]' < "${ACTIVE_SLOT_FILE}")" in
-      blue|green)
-        tr -d '[:space:]' < "${ACTIVE_SLOT_FILE}"
-        return 0
-        ;;
-    esac
-  fi
-
-  printf 'blue'
-}
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -302,6 +272,14 @@ install_nginx_watchdog
 # ---------------------------------------------------------------------------
 MONITORING_FAILED=false
 if [ "${WITH_MONITORING}" = "true" ]; then
+  if [ ! -f "${INFRA_DIR}/.env.monitoring" ]; then
+    log_error ".env.monitoring is missing in ${INFRA_DIR}. Required for --with-monitoring."
+    exit 1
+  fi
+  set -a
+  source "${INFRA_DIR}/.env.monitoring"
+  set +a
+
   log_info "Starting monitoring stack..."
   if bash "${SCRIPT_DIR}/monitoring-sync.sh"; then
     log_ok "Monitoring stack started"
