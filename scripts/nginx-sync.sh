@@ -533,4 +533,12 @@ fi
 
 log_ok "nginx-sync complete - mode: ${ROUTING_MODE}, slot_source: ${ACTIVE_SLOT_SOURCE}, requested slot: ${ACTIVE_SLOT}, routed slot: ${SELECTED_SLOT}, container: ${SELECTED_CONTAINER}"
 
-exit 0
+# Explicit exit with mode validation
+echo "[nginx-sync] FINAL MODE: ${ROUTING_MODE}"
+if [ "${ROUTING_MODE}" = "maintenance" ] || [ "${ROUTING_MODE}" = "active" ]; then
+  echo "[nginx-sync] SUCCESS: valid state"
+  exit 0
+else
+  echo "[nginx-sync] ERROR: invalid state"
+  exit 1
+fi

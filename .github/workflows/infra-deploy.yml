@@ -124,6 +124,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify script versions
+        run: |
+          echo "=== nginx-sync.sh version check ==="
+          head -30 scripts/nginx-sync.sh | grep -E "(set -|FINAL MODE)" || echo "Checking first 30 lines..."
+          echo ""
+          echo "=== Checking for exit 0 logic ==="
+          tail -20 scripts/nginx-sync.sh
+
       - name: Prepare host paths and TLS material
         run: |
           sudo mkdir -p /etc/ssl/api /var/www/certbot /var/log/nginx /var/lib/fieldtrack
@@ -248,8 +256,21 @@ jobs:
         env:
           API_HOSTNAME: api.test.local
         run: |
+          echo "=== Stopping api-green ==="
           docker stop api-green
+          
+          echo "=== Running nginx-sync with debug ==="
+          set +e
           bash scripts/nginx-sync.sh --active-slot blue
+          EXIT_CODE=$?
+          echo "=== nginx-sync EXIT CODE: ${EXIT_CODE} ==="
+          
+          if [ ${EXIT_CODE} -ne 0 ]; then
+            echo "ERROR: nginx-sync failed with exit code ${EXIT_CODE}"
+            exit 1
+          fi
+          
+          echo "=== Testing maintenance mode response ==="
           HTTP_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)"
           echo "Received HTTP code: ${HTTP_CODE}"
           test "${HTTP_CODE}" = "503"
