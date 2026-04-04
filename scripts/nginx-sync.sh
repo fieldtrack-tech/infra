@@ -295,9 +295,23 @@ persist_slot_file() {
   local slot="$1"
   local temp_slot_file
 
-  temp_slot_file="$(mktemp "${STATE_DIR}/active-slot.tmp.XXXXXX")"
+  # Ensure STATE_DIR exists and is writable
+  if [ ! -d "${STATE_DIR}" ]; then
+    if ! mkdir -p "${STATE_DIR}" 2>/dev/null; then
+      log_warn "Cannot create ${STATE_DIR} - slot file will not be persisted"
+      return 0
+    fi
+  fi
+
+  # Create temp file in /tmp first, then move atomically
+  temp_slot_file="$(mktemp)"
   printf '%s\n' "${slot}" > "${temp_slot_file}"
-  mv "${temp_slot_file}" "${ACTIVE_SLOT_FILE}"
+  
+  if ! mv "${temp_slot_file}" "${ACTIVE_SLOT_FILE}" 2>/dev/null; then
+    log_warn "Cannot write to ${ACTIVE_SLOT_FILE} - slot file will not be persisted"
+    rm -f "${temp_slot_file}"
+    return 0
+  fi
 }
 
 rollback_live_config() {
