@@ -48,19 +48,19 @@ jobs:
           echo "Validating .env.monitoring.example contains all required variables..."
           REQUIRED_VARS=("API_HOSTNAME" "GRAFANA_ADMIN_PASSWORD" "METRICS_SCRAPE_TOKEN" "ALERTMANAGER_SLACK_WEBHOOK")
           MISSING_VARS=()
-          
+
           for var in "${REQUIRED_VARS[@]}"; do
             if ! grep -q "^${var}=" .env.monitoring.example; then
               MISSING_VARS+=("${var}")
             fi
           done
-          
+
           if [ ${#MISSING_VARS[@]} -gt 0 ]; then
             echo "ERROR: Missing required variables in .env.monitoring.example:"
             printf '  - %s\n' "${MISSING_VARS[@]}"
             exit 1
           fi
-          
+
           echo "All required variables present in .env.monitoring.example"
 
       - name: Prepare monitoring env and rendered config
@@ -70,17 +70,17 @@ jobs:
           sed -i 's/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=ci-grafana-password/' .env.monitoring
           sed -i 's/^METRICS_SCRAPE_TOKEN=.*/METRICS_SCRAPE_TOKEN=ci-metrics-token/' .env.monitoring
           sed -i 's#^ALERTMANAGER_SLACK_WEBHOOK=.*#ALERTMANAGER_SLACK_WEBHOOK=https://hooks.slack.com/services/T00000000/B00000000/CIWEBHOOK#' .env.monitoring
-          
+
           # Validate all required variables are set
           set -a
           source .env.monitoring
           set +a
-          
+
           : "${API_HOSTNAME:?API_HOSTNAME is required}"
           : "${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}"
           : "${METRICS_SCRAPE_TOKEN:?METRICS_SCRAPE_TOKEN is required}"
           : "${ALERTMANAGER_SLACK_WEBHOOK:?ALERTMANAGER_SLACK_WEBHOOK is required}"
-          
+
           bash scripts/render-prometheus.sh
           bash scripts/render-alertmanager.sh
 
@@ -216,13 +216,13 @@ jobs:
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health >/dev/null
           # Verify /health now proxies to backend and returns 200
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health >/dev/null
-          
+
           # ACTIVE MODE: must NOT contain "maintenance"
           if curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health | grep -q "maintenance"; then
             echo "ERROR: Active mode /health contains 'maintenance'!"
             exit 1
           fi
-          
+
           # Verify API content is served
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-api'
 
@@ -282,35 +282,35 @@ jobs:
         run: |
           echo "=== Stopping api-green ==="
           docker stop api-green
-          
+
           echo "=== Running nginx-sync with debug ==="
           set +e
           bash scripts/nginx-sync.sh --active-slot blue
           EXIT_CODE=$?
           echo "=== nginx-sync EXIT CODE: ${EXIT_CODE} ==="
-          
+
           if [ ${EXIT_CODE} -ne 0 ]; then
             echo "ERROR: nginx-sync failed with exit code ${EXIT_CODE}"
             exit 1
           fi
-          
+
           echo "=== Checking rendered nginx config ==="
           cat nginx/live/api.conf | head -50
-          
+
           echo "=== Verifying nginx is running ==="
           docker ps | grep nginx
-          
+
           echo "=== Testing nginx /infra/health endpoint ==="
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health || echo "Infra health check failed"
-          
+
           echo "=== Testing /health endpoint (should be 503 in maintenance) ==="
           HEALTH_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/health)"
           echo "Health endpoint returned: ${HEALTH_CODE}"
-          
+
           echo "=== Testing maintenance mode response ==="
           HTTP_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)"
           echo "Received HTTP code: ${HTTP_CODE}"
-          
+
           if [ "${HTTP_CODE}" != "503" ]; then
             echo "ERROR: Expected 503, got ${HTTP_CODE}"
             echo "=== Nginx error log ==="
@@ -332,11 +332,11 @@ jobs:
         run: |
           echo "Validating required GitHub secrets are configured..."
           MISSING_SECRETS=()
-          
+
           [ -z "${{ secrets.VPS_HOST }}" ] && MISSING_SECRETS+=("VPS_HOST")
           [ -z "${{ secrets.VPS_USER }}" ] && MISSING_SECRETS+=("VPS_USER")
           [ -z "${{ secrets.VPS_SSH_KEY }}" ] && MISSING_SECRETS+=("VPS_SSH_KEY")
-          
+
           if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
             echo "ERROR: Missing required GitHub secrets:"
             printf '  - %s\n' "${MISSING_SECRETS[@]}"
@@ -344,7 +344,7 @@ jobs:
             echo "Configure these in: Settings > Secrets and variables > Actions > Repository secrets"
             exit 1
           fi
-          
+
           echo "All required GitHub secrets are configured"
 
       - name: Deploy infra via SSH
@@ -356,7 +356,12 @@ jobs:
           port: ${{ secrets.VPS_SSH_PORT || 22 }}
           script: |
             set -euo pipefail
-            
+
+            # Canonical VPS paths — exported here so every nginx-sync call and
+            # the watchdog cron all receive the same values explicitly.
+            export LOG_DIR='/var/log/fieldtrack'
+            export STATE_DIR='/var/lib/fieldtrack'
+
             # Completely safe automation
             if [ ! -d /opt/infra/.git ]; then
                 echo "[deploy] Cloning infra repository..."
@@ -364,14 +369,14 @@ jobs:
                 sudo chown -R $USER:$USER /opt/infra
                 git clone https://github.com/fieldtrack-tech/infra.git /opt/infra
             fi
-            
+
             cd /opt/infra
             echo "[deploy] Fetching latest infra config..."
             git fetch origin
             git reset --hard origin/main
-            
+
             sudo chown -R $USER:$USER /opt/infra
-            
+
             echo "[deploy] Validating infra completeness..."
             bash scripts/validate-paths.sh || {
               echo "[deploy] ERROR: Infra validation failed"
@@ -389,7 +394,7 @@ jobs:
               exit 1
             fi
             WATCHDOG_TAG="fieldtrack-nginx-watchdog"
-            CRON_LINE="* * * * * cd /opt/infra && set -a && . ./.env.monitoring && set +a && bash scripts/nginx-sync.sh >> /opt/infra/nginx-sync-watchdog.log 2>&1 # ${WATCHDOG_TAG}"
+            CRON_LINE="* * * * * LOG_DIR='/var/log/fieldtrack' STATE_DIR='/var/lib/fieldtrack' bash -lc 'cd /opt/infra && set -a && . ./.env.monitoring && set +a && bash scripts/nginx-sync.sh' >> /opt/infra/nginx-sync-watchdog.log 2>&1 # ${WATCHDOG_TAG}"
             (
               crontab -l 2>/dev/null | grep -Fv "${WATCHDOG_TAG}" || true
               printf '%s\n' "${CRON_LINE}"
@@ -417,10 +422,10 @@ jobs:
                  INFRA_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/infra/health || echo "000")"
                  HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health || echo "000")"
                  HEALTH_BODY="$(curl -s http://localhost/health 2>/dev/null || echo "")"
-                 
+
                  MATCH=1
                  if [ "${INFRA_CODE}" != "200" ]; then MATCH=0; fi
-                 
+
                  if [ ! -f /var/lib/fieldtrack/active-slot ] || ! grep -qwE "(blue|green)" /var/lib/fieldtrack/active-slot; then
                    if [ "${HEALTH_CODE}" != "503" ] || ! echo "${HEALTH_BODY}" | grep -q 'maintenance'; then MATCH=0; fi
                  else
@@ -433,7 +438,7 @@ jobs:
                    echo "[deploy] System state intrinsically valid at iteration ${i}."
                    return 0
                  fi
-                 
+
                  echo "[deploy] Mismatch observed on iteration ${i}. Sleeping 2s..."
                  sleep 2
               done
@@ -443,7 +448,7 @@ jobs:
             if ! validate_state; then
               echo "[deploy] ERROR: Controller hit limit. Enforcing Auto-Recovery..."
               bash scripts/nginx-sync.sh || true
-              
+
               if ! validate_state; then
                 echo "[deploy] FATAL: System explicitly failed all convergence paths. Aborting."
                 exit 1

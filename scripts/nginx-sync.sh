@@ -22,8 +22,10 @@
 set -euo pipefail
 
 INFRA_ROOT="/opt/infra"
-STATE_DIR="/var/lib/fieldtrack"
-LOG_DIR="/var/log/fieldtrack"
+# Allow bootstrap (CI or VPS) to export alternate paths via environment.
+# Canonical VPS defaults are used when not overridden.
+STATE_DIR="${STATE_DIR:-/var/lib/fieldtrack}"
+LOG_DIR="${LOG_DIR:-/var/log/fieldtrack}"
 
 if [ -f "${INFRA_ROOT}/.env.monitoring" ]; then
   set -a
@@ -205,6 +207,13 @@ run_probe_with_retries() {
   return 1
 }
 
+# heal_slot_file_if_needed
+# Slot-based routing has been removed; this is a no-op stub retained so
+# any call sites do not crash under `set -euo pipefail`.
+heal_slot_file_if_needed() {
+  : # no-op — slot file healing is not applicable to health-based routing
+}
+
 backend_is_usable() {
   local slot="$1"
   local container_name="api-${slot}"
@@ -232,14 +241,26 @@ backend_is_usable() {
     sleep 1
   done
 
-  mkdir -p /var/log/fieldtrack
+  # LOG_DIR must be ready before we attempt any writes — bootstrap guarantees
+  # this. nginx-sync must never create infra, only consume it.
+  if [[ ! -d "${LOG_DIR}" || ! -w "${LOG_DIR}" ]]; then
+    log_error "LOG_DIR not ready — run bootstrap first"
+    exit 1
+  fi
+
   if [ "${success}" -ge 3 ]; then
     log_ok "${container_name} is STABLE_HEALTHY (Passed 3/3)"
-    echo "$(date -u +%FT%TZ) | ${container_name} | STABLE_HEALTHY | reachability_passed_3_of_3" >> /var/log/fieldtrack/nginx-sync.log || true
+    echo "$(date -u +%FT%TZ) | ${container_name} | STABLE_HEALTHY | reachability_passed_3_of_3" >> "${LOG_DIR}/nginx-sync.log" || {
+      log_error "Failed to write to ${LOG_DIR}/nginx-sync.log"
+      exit 1
+    }
     return 0
   else
     log_warn "${container_name} is UNSTABLE (Passed ${success}/3)"
-    echo "$(date -u +%FT%TZ) | ${container_name} | UNSTABLE | reachability_passed_${success}_of_3" >> /var/log/fieldtrack/nginx-sync.log || true
+    echo "$(date -u +%FT%TZ) | ${container_name} | UNSTABLE | reachability_passed_${success}_of_3" >> "${LOG_DIR}/nginx-sync.log" || {
+      log_error "Failed to write to ${LOG_DIR}/nginx-sync.log"
+      exit 1
+    }
     return 1
   fi
 }
@@ -275,8 +296,16 @@ resolve_active_slot() {
   local blue_usable=false
   local green_usable=false
 
-  mkdir -p "${LOG_DIR}"
-  touch "${LOG_DIR}/nginx-sync.log"
+  # LOG_DIR must already be ready — bootstrap guarantees this.
+  # nginx-sync must never create infra, only consume it.
+  if [[ ! -d "${LOG_DIR}" || ! -w "${LOG_DIR}" ]]; then
+    log_error "LOG_DIR not ready — run bootstrap first"
+    exit 1
+  fi
+  if ! touch "${LOG_DIR}/nginx-sync.log" 2>/dev/null; then
+    log_error "Cannot write to ${LOG_DIR}/nginx-sync.log — check permissions or run bootstrap first."
+    exit 1
+  fi
 
   # ── Step 1 & 2: Evaluate each backend (stable + nginx reachable) ──────────
   log_info "Probing blue backend health..."
@@ -366,7 +395,10 @@ resolve_active_slot() {
     "${ACTIVE_SLOT_SOURCE}" \
     "${ACTIVE_SLOT_ACTION}" \
     "$( [ "${ACTIVE_SLOT}" = "none" ] && echo "maintenance" || echo "active" )" \
-    >> "${LOG_DIR}/nginx-sync.log" || true
+    >> "${LOG_DIR}/nginx-sync.log" || {
+      log_error "Failed to write to ${LOG_DIR}/nginx-sync.log"
+      exit 1
+    }
 }
 
 select_routing_target() {
@@ -380,7 +412,15 @@ select_routing_target() {
   return 0
 }
 
-mkdir -p "${STATE_DIR}" "${LIVE_DIR}" "${BACKUP_DIR}"
+# STATE_DIR and nginx/live+backup must be writable — bootstrap guarantees this.
+# Attempt fallback creation in case nginx-sync is run standalone.
+for _dir in "${STATE_DIR}" "${LIVE_DIR}" "${BACKUP_DIR}"; do
+  if [ ! -d "${_dir}" ]; then
+    mkdir -p "${_dir}" 2>/dev/null || { log_error "${_dir} does not exist and cannot be created. Run bootstrap first."; exit 1; }
+  fi
+done
+unset _dir
+
 
 resolve_active_slot
 
@@ -419,7 +459,10 @@ if [ -f "${OUTPUT_FILE}" ]; then
     if docker ps -q --filter "name=^nginx$" | grep -q . \
        && curl -fsS -o /dev/null -w "%{http_code}" http://localhost/infra/health 2>/dev/null | grep -q '200'; then
       log_ok "[NO-OP] Rendered config identical to disk and nginx is healthy. Nothing to do."
-      printf '%s | action=NO-OP | reason=config-identical\n' "$(date -u +%FT%TZ)" >> "${LOG_DIR}/nginx-sync.log" || true
+      printf '%s | action=NO-OP | reason=config-identical\n' "$(date -u +%FT%TZ)" >> "${LOG_DIR}/nginx-sync.log" || {
+        log_error "Failed to write to ${LOG_DIR}/nginx-sync.log"
+        exit 1
+      }
       exit 0
     fi
     log_warn "Config identical to disk but nginx is unhealthy — reloading anyway."
@@ -437,7 +480,7 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
     exit 1
   fi
   log_ok "Maintenance config validated: no proxy directives"
-  
+
   # Verify maintenance config returns 503 for /health
   if ! grep -A 5 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return 503"; then
     log_error "CRITICAL: Maintenance /health does not return 503"
@@ -445,7 +488,7 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
     exit 1
   fi
   log_ok "Maintenance config validated: /health returns 503"
-  
+
   # Verify /infra/health exists
   if ! grep -q 'location = /infra/health' "${TEMP_CONF_DIR}/api.conf"; then
     log_error "CRITICAL: Maintenance config missing /infra/health endpoint"
@@ -459,7 +502,7 @@ else
     exit 1
   fi
   log_ok "Active config validated: has proxy directives"
-  
+
   # Verify active /health proxies to backend (MUST NOT have "return" in /health block)
   if grep -A 5 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return [0-9]"; then
     log_error "CRITICAL: Active /health contains static return statement"
@@ -467,7 +510,7 @@ else
     exit 1
   fi
   log_ok "Active config validated: /health proxies to backend"
-  
+
   # Verify /infra/health exists
   if ! grep -q 'location = /infra/health' "${TEMP_CONF_DIR}/api.conf"; then
     log_error "CRITICAL: Active config missing /infra/health endpoint"
@@ -548,7 +591,7 @@ log_ok "/infra/health correctly returns 200 (nginx is alive)"
   CONVERGED=false
   for i in $(seq 1 30); do
     MATCH=true
-    
+
     if [ "${ROUTING_MODE}" = "maintenance" ]; then
       HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" -H "Host: ${API_HOSTNAME}" http://localhost/health || echo "000")"
       HEALTH_BODY="$(curl -s -H "Host: ${API_HOSTNAME}" http://localhost/health 2>/dev/null || echo "")"
@@ -585,7 +628,7 @@ log_ok "/infra/health correctly returns 200 (nginx is alive)"
       log_warn "Last Curl Out (Code ${HEALTH_CODE}): ${HEALTH_BODY}"
     fi
     log_warn "-----------------------"
-    
+
     export NGINX_SYNC_RETRY=$(( ${NGINX_SYNC_RETRY:-0} + 1 ))
     if [ "${NGINX_SYNC_RETRY}" -le 1 ]; then
       log_warn "Convergence timed out. Retrying nginx-sync once (attempt ${NGINX_SYNC_RETRY}/1)..."
@@ -596,7 +639,7 @@ log_ok "/infra/health correctly returns 200 (nginx is alive)"
       exit 1
     fi
   fi
-  
+
   if [ "${ROUTING_MODE}" = "active" ]; then
     log_info "Running routed /ready probe through nginx (non-gating)..."
     if run_probe_with_retries "Routed /ready probe through nginx" probe_ready_through_nginx; then
