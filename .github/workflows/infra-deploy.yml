@@ -270,10 +270,25 @@ jobs:
             exit 1
           fi
           
+          echo "=== Checking rendered nginx config ==="
+          cat nginx/live/api.conf | head -50
+          
+          echo "=== Verifying nginx is running ==="
+          docker ps | grep nginx
+          
+          echo "=== Testing nginx /health endpoint ==="
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health || echo "Health check failed"
+          
           echo "=== Testing maintenance mode response ==="
           HTTP_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)"
           echo "Received HTTP code: ${HTTP_CODE}"
-          test "${HTTP_CODE}" = "503"
+          
+          if [ "${HTTP_CODE}" != "503" ]; then
+            echo "ERROR: Expected 503, got ${HTTP_CODE}"
+            echo "=== Nginx error log ==="
+            docker exec nginx cat /var/log/nginx/api_error.log | tail -20 || echo "Could not read error log"
+            exit 1
+          fi
 
   deploy:
     name: Deploy to VPS
