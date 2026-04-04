@@ -532,3 +532,5 @@ else
 fi
 
 log_ok "nginx-sync complete - mode: ${ROUTING_MODE}, slot_source: ${ACTIVE_SLOT_SOURCE}, requested slot: ${ACTIVE_SLOT}, routed slot: ${SELECTED_SLOT}, container: ${SELECTED_CONTAINER}"
+
+exit 0
