@@ -38,9 +38,6 @@ if [ -f "${INFRA_ROOT}/.env.monitoring" ]; then
   set +a
 fi
 
-ACTIVE_SLOT_FILE="${STATE_DIR}/active-slot"
-SLOT_BACKUP_FILE="${STATE_DIR}/active-slot.backup"
-LAST_GOOD_FILE="${STATE_DIR}/last-good"
 TEMPLATE_FILE="${INFRA_ROOT}/nginx/api.conf"
 MAINTENANCE_TEMPLATE_FILE="${INFRA_ROOT}/nginx/api.maintenance.conf"
 LIVE_DIR="${INFRA_ROOT}/nginx/live"
@@ -61,8 +58,6 @@ ACTIVE_SLOT_ACTION="SWITCH"  # SWITCH or NO-OP
 SELECTED_SLOT=""
 SELECTED_CONTAINER=""
 ROUTING_MODE="active"
-FALLBACK_USED=false
-RECOVERED_SLOT=false
 EXPECTED_DEPLOY_SHA="${EXPECTED_DEPLOY_SHA:-}"
 ORIGINAL_ARGS=("$@")
 
@@ -222,31 +217,6 @@ run_probe_with_retries() {
   return 1
 }
 
-other_slot() {
-  case "$1" in
-    blue) printf 'green' ;;
-    green) printf 'blue' ;;
-    *) return 1 ;;
-  esac
-}
-
-read_slot_from_last_good() {
-  if [ ! -f "${LAST_GOOD_FILE}" ]; then
-    return 0
-  fi
-
-  awk -F= '/^slot=/{print $2}' "${LAST_GOOD_FILE}" 2>/dev/null | tr -d '[:space:]'
-}
-
-read_slot_from_live_config() {
-  if [ ! -f "${OUTPUT_FILE}" ]; then
-    return 0
-  fi
-
-  grep -oE 'http://(api-blue|api-green):3000' "${OUTPUT_FILE}" 2>/dev/null \
-    | grep -oE 'api-blue|api-green' | head -1 | sed 's/^api-//'
-}
-
 backend_is_usable() {
   local slot="$1"
   local container_name="api-${slot}"
@@ -286,31 +256,6 @@ backend_is_usable() {
   fi
 }
 
-# discover_slot_from_backends removed — resolve_active_slot is the single authority.
-
-persist_slot_file() {
-  local slot="$1"
-  local temp_slot_file
-
-  # Ensure STATE_DIR exists and is writable
-  if [ ! -d "${STATE_DIR}" ]; then
-    if ! mkdir -p "${STATE_DIR}" 2>/dev/null; then
-      log_warn "Cannot create ${STATE_DIR} - slot file will not be persisted"
-      return 0
-    fi
-  fi
-
-  # Create temp file in /tmp first, then move atomically
-  temp_slot_file="$(mktemp)"
-  printf '%s\n' "${slot}" > "${temp_slot_file}"
-  
-  if ! mv "${temp_slot_file}" "${ACTIVE_SLOT_FILE}" 2>/dev/null; then
-    log_warn "Cannot write to ${ACTIVE_SLOT_FILE} - slot file will not be persisted"
-    rm -f "${temp_slot_file}"
-    return 0
-  fi
-}
-
 rollback_live_config() {
   if [ -n "${BACKUP_FILE:-}" ] && [ -f "${BACKUP_FILE}" ]; then
     cp "${BACKUP_FILE}" "${OUTPUT_FILE}"
@@ -323,8 +268,7 @@ rollback_live_config() {
     docker compose -f "${NGINX_COMPOSE_FILE}" stop nginx >/dev/null 2>&1 || true
     log_info "Removed candidate config and stopped nginx (no backup was available)"
   fi
-  
-  # Print debugging information on rollback
+
   log_error "=== ROLLBACK DEBUGGING INFO ==="
   log_error "Active slot: ${ACTIVE_SLOT:-unknown}"
   log_error "Selected slot: ${SELECTED_SLOT:-unknown}"
@@ -337,23 +281,6 @@ rollback_live_config() {
   log_error "Nginx error log (last 20 lines):"
   docker exec nginx cat /var/log/nginx/api_error.log 2>/dev/null | tail -20 | sed 's/^/  /' >&2 || log_error "Could not read nginx error log"
   log_error "=== END DEBUGGING INFO ==="
-}
-
-heal_slot_file_if_needed() {
-  if [ "${ROUTING_MODE}" != "active" ]; then
-    return 0
-  fi
-
-  if [ -n "${ACTIVE_SLOT_OVERRIDE}" ] && [ "${RECOVERED_SLOT}" != "true" ] && [ "${FALLBACK_USED}" != "true" ]; then
-    return 0
-  fi
-
-  if [ "${SELECTED_SLOT}" = "${ACTIVE_SLOT}" ] && [ "${RECOVERED_SLOT}" != "true" ] && [ "${FALLBACK_USED}" != "true" ]; then
-    return 0
-  fi
-
-  persist_slot_file "${SELECTED_SLOT}"
-  log_info "Healed active slot file to '${SELECTED_SLOT}'"
 }
 
 resolve_active_slot() {
@@ -461,7 +388,6 @@ select_routing_target() {
 
   SELECTED_SLOT="${ACTIVE_SLOT}"
   SELECTED_CONTAINER="api-${SELECTED_SLOT}"
-  FALLBACK_USED=false
   log_info "Selected backend ${SELECTED_CONTAINER} via ${ACTIVE_SLOT_SOURCE}"
   return 0
 }
