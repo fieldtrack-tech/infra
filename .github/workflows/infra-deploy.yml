@@ -169,7 +169,11 @@ jobs:
 
       - name: Verify nginx maintenance mode before API
         run: |
-          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health >/dev/null
+          # Verify nginx infra is alive
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health >/dev/null
+          # Verify /health returns 503 in maintenance mode (no backend)
+          test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/health)" = "503"
+          # Verify root returns 503
           test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)" = "503"
 
       - name: Start mock active API and durable slot
@@ -208,7 +212,11 @@ jobs:
 
       - name: Verify routed API health
         run: |
+          # Verify nginx infra is alive
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health >/dev/null
+          # Verify /health now proxies to backend and returns 200
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health >/dev/null
+          # Verify API content is served
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-api'
 
       - name: Start mock fallback API
@@ -285,8 +293,12 @@ jobs:
           echo "=== Verifying nginx is running ==="
           docker ps | grep nginx
           
-          echo "=== Testing nginx /health endpoint ==="
-          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health || echo "Health check failed"
+          echo "=== Testing nginx /infra/health endpoint ==="
+          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health || echo "Infra health check failed"
+          
+          echo "=== Testing /health endpoint (should be 503 in maintenance) ==="
+          HEALTH_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/health)"
+          echo "Health endpoint returned: ${HEALTH_CODE}"
           
           echo "=== Testing maintenance mode response ==="
           HTTP_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)"

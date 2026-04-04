@@ -127,6 +127,22 @@ curl -kfsS -H "Host: <API_HOSTNAME>" https://127.0.0.1/ready
 
 ## Services
 
+### Health Endpoints
+
+The system has two distinct health endpoints:
+
+- **`/infra/health`** - Nginx infrastructure liveness
+  - Always returns 200 if nginx is alive
+  - Never depends on backend
+  - Used for container liveness probes and nginx validation
+
+- **`/health`** - API application health
+  - **Active mode**: Proxies to API backend (reflects actual API health)
+  - **Maintenance mode**: Returns 503 (no healthy backend available)
+  - Used for monitoring, CI/CD, and load balancer health checks
+
+See [Health Endpoints Documentation](docs/HEALTH_ENDPOINTS.md) for details.
+
 ### nginx
 
 ```bash

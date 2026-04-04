@@ -171,7 +171,7 @@ wait_for_nginx() {
   log_info "Waiting for nginx liveness..."
   # shellcheck disable=SC2034
   for attempt in $(seq 1 30); do
-    if docker exec nginx sh -eu -c "wget -q --spider --timeout=5 --tries=1 http://127.0.0.1/health" >/dev/null 2>&1; then
+    if docker exec nginx sh -eu -c "wget -q --spider --timeout=5 --tries=1 http://127.0.0.1/infra/health" >/dev/null 2>&1; then
       log_ok "nginx ready"
       return 0
     fi
@@ -268,11 +268,11 @@ fi
 log_ok "nginx sync completed"
 
 wait_for_nginx
-log_info "Validating host-level nginx /health endpoint..."
-if curl -sf http://localhost/health >/dev/null; then
-  log_ok "Host-level /health probe passed"
+log_info "Validating host-level nginx /infra/health endpoint..."
+if curl -sf http://localhost/infra/health >/dev/null; then
+  log_ok "Host-level /infra/health probe passed"
 else
-  log_error "Host-level /health probe failed."
+  log_error "Host-level /infra/health probe failed."
   exit 1
 fi
 

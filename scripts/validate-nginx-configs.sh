@@ -58,11 +58,21 @@ fi
 
 log_info "Checking maintenance config status codes..."
 
-if grep -q 'location = /health' "${MAINTENANCE_CONFIG}"; then
-  if grep -A 3 'location = /health' "${MAINTENANCE_CONFIG}" | grep -q 'return 200'; then
-    log_pass "Maintenance /health returns 200"
+if grep -q 'location = /infra/health' "${MAINTENANCE_CONFIG}"; then
+  if grep -A 3 'location = /infra/health' "${MAINTENANCE_CONFIG}" | grep -q 'return 200'; then
+    log_pass "Maintenance /infra/health returns 200"
   else
-    log_fail "Maintenance /health does not return 200"
+    log_fail "Maintenance /infra/health does not return 200"
+  fi
+else
+  log_fail "Maintenance config missing /infra/health location"
+fi
+
+if grep -q 'location = /health' "${MAINTENANCE_CONFIG}"; then
+  if grep -A 3 'location = /health' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
+    log_pass "Maintenance /health returns 503"
+  else
+    log_fail "Maintenance /health does not return 503 (should signal unhealthy state)"
   fi
 else
   log_fail "Maintenance config missing /health location"
@@ -88,11 +98,42 @@ else
   log_fail "Maintenance config missing / location"
 fi
 
-# ── Check 3: Active config has required placeholders ──────────────────────────
+# ── Check 3: Active config has required endpoints ─────────────────────────────
 
-log_info "Checking active config placeholders..."
+log_info "Checking active config endpoints..."
 
 ACTIVE_CONFIG="nginx/api.conf"
+
+if [ ! -f "${ACTIVE_CONFIG}" ]; then
+  log_fail "Active config not found: ${ACTIVE_CONFIG}"
+else
+  # Check /infra/health exists
+  if grep -q 'location = /infra/health' "${ACTIVE_CONFIG}"; then
+    log_pass "Active config has /infra/health endpoint"
+  else
+    log_fail "Active config missing /infra/health endpoint"
+  fi
+  
+  # Check /health proxies to backend (should NOT have "return" in the HTTPS block)
+  # Note: HTTP block may have redirect (return 301), which is OK
+  HTTPS_HEALTH_BLOCK=$(awk '/server \{/{p++} p && /listen 443/{https=1} https && /location = \/health/{found=1} found{print} found && /\}/{exit}' "${ACTIVE_CONFIG}")
+  
+  if echo "${HTTPS_HEALTH_BLOCK}" | grep -q 'proxy_pass'; then
+    log_pass "Active /health proxies to backend"
+  else
+    log_fail "Active /health does not proxy to backend"
+  fi
+  
+  if echo "${HTTPS_HEALTH_BLOCK}" | grep -q 'return [45][0-9][0-9]'; then
+    log_fail "Active HTTPS /health contains static error return (should proxy only)"
+  else
+    log_pass "Active HTTPS /health does not contain static error return"
+  fi
+fi
+
+# ── Check 4: Active config has required placeholders ──────────────────────────
+
+log_info "Checking active config placeholders..."
 
 if [ ! -f "${ACTIVE_CONFIG}" ]; then
   log_fail "Active config not found: ${ACTIVE_CONFIG}"
@@ -110,7 +151,7 @@ else
   fi
 fi
 
-# ── Check 4: Both configs have required placeholders ──────────────────────────
+# ── Check 5: Both configs have required placeholders ──────────────────────────
 
 log_info "Checking both configs have API_HOSTNAME placeholder..."
 

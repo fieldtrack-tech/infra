@@ -187,8 +187,9 @@ wait_for_nginx_running() {
 }
 
 probe_nginx_liveness() {
+  # Use /infra/health for nginx liveness (never depends on backend)
   docker exec nginx sh -eu -c \
-    "wget -q --spider --timeout=5 --tries=1 http://127.0.0.1/health"
+    "wget -q --spider --timeout=5 --tries=1 http://127.0.0.1/infra/health"
 }
 
 probe_route_through_nginx() {
@@ -505,12 +506,20 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   fi
   log_ok "Maintenance config validated: no proxy directives"
   
-  # Verify maintenance config returns 503 for root
-  if ! grep -q "return 503" "${TEMP_CONF_DIR}/api.conf"; then
-    log_error "CRITICAL: Maintenance config does not return 503"
+  # Verify maintenance config returns 503 for /health
+  if ! grep -A 2 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return 503"; then
+    log_error "CRITICAL: Maintenance /health does not return 503"
+    log_error "Maintenance mode MUST return 503 for /health to signal unhealthy state"
     exit 1
   fi
-  log_ok "Maintenance config validated: returns 503"
+  log_ok "Maintenance config validated: /health returns 503"
+  
+  # Verify /infra/health exists
+  if ! grep -q 'location = /infra/health' "${TEMP_CONF_DIR}/api.conf"; then
+    log_error "CRITICAL: Maintenance config missing /infra/health endpoint"
+    exit 1
+  fi
+  log_ok "Maintenance config validated: /infra/health exists"
 else
   # Active mode MUST have upstream or proxy_pass
   if ! grep -v "^[[:space:]]*#" "${TEMP_CONF_DIR}/api.conf" | grep -qE "proxy_pass|upstream"; then
@@ -518,6 +527,21 @@ else
     exit 1
   fi
   log_ok "Active config validated: has proxy directives"
+  
+  # Verify active /health proxies to backend (MUST NOT have "return" in /health block)
+  if grep -A 5 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return [0-9]"; then
+    log_error "CRITICAL: Active /health contains static return statement"
+    log_error "Active mode MUST proxy /health to backend, not return static response"
+    exit 1
+  fi
+  log_ok "Active config validated: /health proxies to backend"
+  
+  # Verify /infra/health exists
+  if ! grep -q 'location = /infra/health' "${TEMP_CONF_DIR}/api.conf"; then
+    log_error "CRITICAL: Active config missing /infra/health endpoint"
+    exit 1
+  fi
+  log_ok "Active config validated: /infra/health exists"
 fi
 
 validate_candidate_config "${TEMP_CONF_DIR}"
@@ -558,19 +582,44 @@ fi
 
 # Post-reload validation: Verify nginx is responding correctly
 log_info "Validating nginx responses match expected mode..."
+
+# Always verify /infra/health works (nginx liveness)
+INFRA_HEALTH_CODE="$(docker exec nginx sh -c "wget -q -O /dev/null -S http://127.0.0.1/infra/health 2>&1 | grep 'HTTP/' | awk '{print \$2}'" || echo "000")"
+if [ "${INFRA_HEALTH_CODE}" != "200" ]; then
+  log_error "CRITICAL: /infra/health returned ${INFRA_HEALTH_CODE} (expected 200)"
+  rollback_live_config
+  exit 1
+fi
+log_ok "/infra/health correctly returns 200 (nginx is alive)"
+
 if [ "${ROUTING_MODE}" = "maintenance" ]; then
-  # In maintenance mode, root should return 503, not 502
-  HTTP_CODE="$(docker exec nginx sh -c "wget -q -O /dev/null -S http://127.0.0.1/ 2>&1 | grep 'HTTP/' | awk '{print \$2}'" || echo "000")"
-  if [ "${HTTP_CODE}" = "502" ]; then
-    log_error "CRITICAL: Maintenance mode returned 502 (backend resolution failure)"
+  # In maintenance mode, /health should return 503
+  HEALTH_CODE="$(docker exec nginx sh -c "wget -q -O /dev/null -S http://127.0.0.1/health 2>&1 | grep 'HTTP/' | awk '{print \$2}'" || echo "000")"
+  if [ "${HEALTH_CODE}" = "502" ]; then
+    log_error "CRITICAL: Maintenance /health returned 502 (backend resolution failure)"
     log_error "This means nginx is trying to proxy to backends that don't exist"
     rollback_live_config
     exit 1
-  elif [ "${HTTP_CODE}" = "503" ]; then
-    log_ok "Maintenance mode correctly returns 503"
+  elif [ "${HEALTH_CODE}" = "503" ]; then
+    log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
+  elif [ "${HEALTH_CODE}" = "200" ]; then
+    log_error "CRITICAL: Maintenance /health returned 200 (should be 503)"
+    log_error "This masks the fact that no backend is available"
+    rollback_live_config
+    exit 1
   else
-    log_warn "Maintenance mode returned unexpected code: ${HTTP_CODE} (expected 503)"
+    log_warn "Maintenance /health returned unexpected code: ${HEALTH_CODE} (expected 503)"
   fi
+  
+  # Verify response contains "maintenance"
+  HEALTH_BODY="$(docker exec nginx sh -c "wget -q -O - http://127.0.0.1/health 2>/dev/null" || echo "")"
+  if ! echo "${HEALTH_BODY}" | grep -q "maintenance"; then
+    log_error "CRITICAL: Maintenance /health response does not contain 'maintenance'"
+    log_error "Response: ${HEALTH_BODY}"
+    rollback_live_config
+    exit 1
+  fi
+  log_ok "Maintenance /health response correctly indicates maintenance mode"
 fi
 
 if [ "${ROUTING_MODE}" = "active" ]; then
