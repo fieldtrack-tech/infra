@@ -463,7 +463,7 @@ fi
 
 TEMP_CONF_DIR="$(mktemp -d)"
 cleanup() {
-  rm -rf "${TEMP_CONF_DIR}"
+  rm -rf "${TEMP_CONF_DIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
