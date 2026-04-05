@@ -69,9 +69,13 @@ assert_dir_exists_tracked() {
 assert_no_hardcoded_usage() {
   local matches
 
-  matches=$(grep -nE '/opt/infra|/var/log/fieldtrack|/var/lib/fieldtrack' scripts/*.sh \
-    | grep -vE '^\s*#' \
-    | grep -vE 'INFRA_ROOT|LOG_DIR|STATE_DIR' || true)
+  # Collect candidate matches from script files (filename:lineno:content).
+  # Then filter out lines where the content portion (after filename:lineno:) is a comment,
+  # and also ignore canonical variable definitions.
+  matches=$(grep -nE '/opt/infra|/var/log/fieldtrack|/var/lib/fieldtrack' scripts/*.sh || true)
+  matches=$(printf '%s\n' "${matches}" \
+    | grep -vE '^[^:]+:[0-9]+:\s*#' \
+    | grep -vE '\b(INFRA_ROOT|LOG_DIR|STATE_DIR)\b' || true)
 
   if [[ -n "$matches" ]]; then
     echo "[check-contract] ERROR Hardcoded path usage found:"
