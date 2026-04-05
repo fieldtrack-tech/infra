@@ -22,7 +22,7 @@
 #   API_HOSTNAME   Public hostname served by nginx (no scheme, no slash)
 #
 # Optional environment:
-#   API_BACKEND_CONTAINER   Docker container name on api_network (default: api)
+#   API_BACKEND_CONTAINER   Docker container name on api_network (default: auto-discovers api-green then api-blue)
 #   EXPECTED_DEPLOY_SHA     When set, backend image labels must match
 # =============================================================================
 set -euo pipefail
@@ -113,7 +113,18 @@ resolve_backend_container() {
     return 0
   fi
 
-  SELECTED_CONTAINER="api"
+  # Auto-discover blue/green deployment containers in preference order
+  local disc_candidate
+  for disc_candidate in "api-green" "api-blue"; do
+    if backend_exists "${disc_candidate}" 2>/dev/null; then
+      SELECTED_CONTAINER="${disc_candidate}"
+      CONTAINER_SOURCE="default"
+      log_info "Backend container (auto-discovered): ${SELECTED_CONTAINER}"
+      return 0
+    fi
+  done
+
+  SELECTED_CONTAINER="api-green"
   CONTAINER_SOURCE="default"
   log_info "Backend container (default): ${SELECTED_CONTAINER}"
 }
@@ -328,7 +339,7 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   log_ok "Maintenance config validated: no proxy directives"
 
   # Verify maintenance config returns 503 for /health
-  if ! grep -A 2 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return 503"; then
+  if ! grep -A 3 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return 503"; then
     log_error "CRITICAL: Maintenance /health does not return 503"
     log_error "Maintenance mode MUST return 503 for /health to signal unhealthy state"
     exit 1

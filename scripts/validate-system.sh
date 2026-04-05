@@ -78,7 +78,7 @@ if [ -d "${STATE_DIR}" ]; then
       log_fail "Active slot file has invalid value: ${SLOT_VALUE}"
     fi
   else
-    log_info "No active-slot file (expected when using single backend container api; legacy blue/green only)"
+    log_info "No active-slot file (expected in health-based routing; blue/green slot is detected dynamically)"
   fi
 else
   log_warn "State directory does not exist (will be created by bootstrap)"
