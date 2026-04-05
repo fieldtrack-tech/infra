@@ -374,6 +374,26 @@ restart_nginx() {
   (cd "${INFRA_DIR}" && docker compose -f docker-compose.nginx.yml restart nginx) >/dev/null 2>&1
 }
 
+apply_nginx_config() {
+  # Strategy: try a graceful in-process reload first (zero downtime); fall
+  # back to a full container restart only if the reload fails. This minimises
+  # the window where no worker is listening while keeping the guarantee that
+  # the new config is always picked up cleanly.
+  #
+  # `nginx -t` is run against the file inside the container (the live bind
+  # mount) so the result reflects exactly what nginx will load on reload.
+  if docker exec nginx nginx -t >/dev/null 2>&1; then
+    if docker exec nginx nginx -s reload >/dev/null 2>&1; then
+      log_info "nginx config reloaded in-process (graceful)"
+      return 0
+    fi
+    log_warn "nginx -s reload returned non-zero; falling back to container restart"
+  else
+    log_warn "nginx -t failed inside container; falling back to container restart"
+  fi
+  restart_nginx
+}
+
 rollback_live_config() {
   if [ -n "${BACKUP_FILE:-}" ] && [ -f "${BACKUP_FILE}" ]; then
     cp "${BACKUP_FILE}" "${OUTPUT_FILE}"
@@ -554,17 +574,9 @@ mv "${TEMP_CONF_DIR}/api.conf" "${OUTPUT_FILE}"
 log_ok "Config written atomically -> ${OUTPUT_FILE}"
 
 if docker ps --format '{{.Names}}' | grep -qx 'nginx'; then
-  log_info "Restarting nginx to apply new config..."
-  # Use a full container restart rather than `nginx -s reload`.
-  # nginx -s reload sends HUP and exits immediately; the master then forks
-  # new workers and only asks old workers to drain — but old workers continue
-  # serving new connections until new workers are ready. On a VPS that has
-  # gone through multiple failed deploy/rollback cycles this leaves stale
-  # worker generations running old configs indefinitely. A container restart
-  # kills all processes and starts a fresh nginx that reads the current
-  # config file from the bind mount from the very first request.
-  if ! restart_nginx; then
-    log_error "nginx restart failed. Rolling back..."
+  log_info "Applying new nginx config..."
+  if ! apply_nginx_config; then
+    log_error "nginx apply failed. Rolling back..."
     rollback_live_config
     exit 1
   fi
@@ -583,23 +595,36 @@ if ! wait_for_nginx_running; then
   exit 1
 fi
 
-# Post-reload validation: Verify nginx is responding correctly
+# Post-apply validation: Verify nginx is responding correctly
 log_info "Validating nginx responses match expected mode..."
 
-# Verify /infra/health works (nginx liveness).
-# A brief sleep gives the fresh nginx container time to bind ports after
-# the container restart; wait_for_nginx_running already confirmed the
-# container is in 'running' state but the listener may not be ready yet.
-sleep 1
+# Verify nginx is responsive before checking mode-specific behaviour.
+# `wait_for_nginx_running` confirmed the container state is 'running', but
+# the listener may not yet be bound (after a restart) or new workers may
+# still be spinning up (after a reload). Use the existing retry helper so
+# the first probe failure is not immediately fatal.
+log_info "Waiting for nginx to become responsive..."
+if ! run_probe_with_retries "Nginx liveness check" probe_nginx_liveness; then
+  log_error "CRITICAL: nginx did not become responsive after apply"
+  rollback_live_config
+  exit 1
+fi
+log_ok "Nginx is responsive"
+
+# Verify /infra/health specifically (needed for post-mode checks below).
+# probe_nginx_liveness already hit this endpoint, but we also need the HTTP
+# status code for the explicit 200 assertion.
 INFRA_HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
   --max-time 5 \
   -H "Host: ${API_HOSTNAME}" \
   http://127.0.0.1/infra/health 2>/dev/null || echo "000")"
 if [ "${INFRA_HEALTH_CODE}" != "200" ]; then
-  log_error "CRITICAL: /infra/health returned ${INFRA_HEALTH_CODE} (expected 200)"
-  log_error "Container restart completed but nginx is not responding — check docker logs nginx"
-  rollback_live_config
-  exit 1
+  log_warn "/infra/health returned ${INFRA_HEALTH_CODE}; retrying..."
+  if ! run_probe_with_retries "Infra health retry" probe_nginx_liveness; then
+    log_error "CRITICAL: /infra/health failed after retries (last code: ${INFRA_HEALTH_CODE})"
+    rollback_live_config
+    exit 1
+  fi
 fi
 log_ok "/infra/health correctly returns 200 (nginx is alive)"
 
@@ -625,27 +650,44 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
     --resolve "${API_HOSTNAME}:443:127.0.0.1" \
     "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
 
-  if [ "${HEALTH_CODE}" = "503" ]; then
-    log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
-  elif [ "${HEALTH_CODE}" = "502" ]; then
-    log_error "CRITICAL: Maintenance /health returned 502"
-    log_error "Nginx is still proxying /health to the dead backend — maintenance template has proxy_pass"
-    rollback_live_config
-    exit 1
-  elif [ "${HEALTH_CODE}" = "200" ]; then
-    log_error "CRITICAL: Maintenance /health returned 200 (should be 503)"
-    log_error "This masks the fact that no backend is available"
-    rollback_live_config
-    exit 1
-  else
-    log_error "CRITICAL: Maintenance /health returned unexpected code: ${HEALTH_CODE} (expected 503)"
-    log_error "Probe: HTTPS ${API_HOSTNAME}/health via --resolve to 127.0.0.1"
-    rollback_live_config
-    exit 1
+  # Allow convergence: after a reload, nginx workers transition gradually.
+  # Retry up to 3 times with 1s sleep before treating a non-503 as fatal.
+  if [ "${HEALTH_CODE}" != "503" ]; then
+    log_warn "Maintenance /health returned ${HEALTH_CODE}; retrying..."
+    _retry_ok=false
+    for _i in 1 2 3; do
+      sleep 1
+      HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 5 -k \
+        --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+        "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
+      HEALTH_BODY="$(curl -s \
+        --max-time 5 -k \
+        --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+        "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+      if [ "${HEALTH_CODE}" = "503" ]; then
+        _retry_ok=true
+        break
+      fi
+    done
+    if [ "${_retry_ok}" != "true" ]; then
+      log_error "CRITICAL: Maintenance /health did not stabilize to 503 (last code: ${HEALTH_CODE})"
+      log_error "Probe: HTTPS ${API_HOSTNAME}/health via --resolve to 127.0.0.1"
+      rollback_live_config
+      exit 1
+    fi
   fi
+  log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
 
-  # Verify response body contains 'maintenance' — proves the static JSON body
-  # from the return directive is being served, not nginx's default error page.
+  # Verify response body contains 'maintenance'.
+  # Guard against empty body (transient network/timing issue) with one retry.
+  if [ -z "${HEALTH_BODY}" ]; then
+    log_warn "Empty response body for maintenance /health; retrying..."
+    HEALTH_BODY="$(curl -s \
+      --max-time 5 -k \
+      --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+      "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+  fi
   if ! printf '%s' "${HEALTH_BODY}" | grep -q 'maintenance'; then
     log_error "CRITICAL: Maintenance /health response body does not contain 'maintenance'"
     log_error "Expected: {\"status\":\"maintenance\",...}"
