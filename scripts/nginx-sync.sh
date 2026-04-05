@@ -51,15 +51,38 @@ log_ok()    { printf '[nginx-sync] OK    %s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 # Mutual-exclusion lock — prevents concurrent cron + deploy executions from
-# writing conflicting configs to nginx/live/. Uses a lock file + flock.
-# Any second invocation that cannot acquire the lock exits 0 immediately.
+# writing conflicting configs to nginx/live/. Uses an atomic mkdir + PID file
+# so it works correctly under set -e and in all environments (no flock/exec).
+#
+# Why NOT flock + exec N>file:
+#   In bash with set -euo pipefail, `exec N>file` is a bare statement subject
+#   to set -e. If the redirect fails for any reason (permission, FD limit, CI
+#   sandbox restrictions), bash exits 1 immediately and silently — producing
+#   no further log output. This is not recoverable without disabling set -e.
+#
+# The mkdir approach is POSIX-portable and always safe under set -e because:
+#   - `mkdir` success/failure is tested via `if ! mkdir`, which set -e ignores
+#   - No file descriptor manipulation required
+#   - Stale locks are handled via PID liveness check
 # ---------------------------------------------------------------------------
-LOCK_FILE="/tmp/nginx-sync.lock"
-exec 200>"${LOCK_FILE}"
-if ! flock -n 200 2>/dev/null; then
-  log_warn "Another nginx-sync is already running (lock held). Exiting to avoid concurrent execution."
-  exit 0
+LOCK_DIR="${TMPDIR:-/tmp}/nginx-sync.lck"
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  LOCK_PID=""
+  [ -f "${LOCK_DIR}/pid" ] && LOCK_PID="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+  if [ -n "${LOCK_PID}" ] && kill -0 "${LOCK_PID}" 2>/dev/null; then
+    log_warn "Another nginx-sync is already running (PID ${LOCK_PID}). Exiting to avoid concurrent execution."
+    exit 0
+  fi
+  # Stale lock: the owning process is gone — clean up and re-acquire
+  log_info "Removing stale lock (PID ${LOCK_PID:-unknown} is no longer running)"
+  rm -rf "${LOCK_DIR}"
+  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    log_warn "Could not acquire exclusive lock at ${LOCK_DIR}; proceeding without mutual exclusion"
+  fi
 fi
+printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
+# Lock directory is removed on exit by the cleanup() function defined below
+# (cleanup() is set up after mktemp and covers both LOCK_DIR and TEMP_CONF_DIR).
 
 ALLOW_MISSING_BACKEND=false
 SELECTED_CONTAINER=""
@@ -404,6 +427,7 @@ fi
 TEMP_CONF_DIR="$(mktemp -d)"
 cleanup() {
   rm -rf "${TEMP_CONF_DIR}" 2>/dev/null || true
+  rm -rf "${LOCK_DIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
