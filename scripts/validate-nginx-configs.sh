@@ -75,19 +75,29 @@ MAINTENANCE_CONFIG="nginx/api.maintenance.conf"
 if [ ! -f "${MAINTENANCE_CONFIG}" ]; then
   log_fail "Maintenance config not found: ${MAINTENANCE_CONFIG}"
 else
-  if grep -v "^[[:space:]]*#" "${MAINTENANCE_CONFIG}" | grep -q "proxy_pass"; then
+  # NOTE: Do NOT use `grep -v ... | grep -q` here. With set -o pipefail, when
+  # grep -q finds a match and exits early (its purpose with -q), grep -v may
+  # receive SIGPIPE and exit 141. pipefail makes the pipeline exit 141 (the
+  # leftmost non-zero), which `if` sees as non-zero — taking the else branch
+  # and falsely logging a pass even when the pattern WAS found (false negative).
+  # Use single-command awk with an explicit found-flag to avoid all pipe-related
+  # exit-code issues. exit(found?0:1) returns 0 (true for `if`) when found.
+  if awk '/^[[:space:]]*#/{next} /proxy_pass/{found=1;exit} END{exit(found?0:1)}' \
+      "${MAINTENANCE_CONFIG}"; then
     log_fail "Maintenance config contains proxy_pass (CRITICAL: maintenance mode must not proxy)"
   else
     log_pass "Maintenance config has no proxy_pass directives"
   fi
-  
-  if grep -v "^[[:space:]]*#" "${MAINTENANCE_CONFIG}" | grep -q "upstream"; then
+
+  if awk '/^[[:space:]]*#/{next} /upstream/{found=1;exit} END{exit(found?0:1)}' \
+      "${MAINTENANCE_CONFIG}"; then
     log_fail "Maintenance config contains upstream blocks (CRITICAL: maintenance mode must not use upstreams)"
   else
     log_pass "Maintenance config has no upstream blocks"
   fi
-  
-  if grep -v "^[[:space:]]*#" "${MAINTENANCE_CONFIG}" | grep -qE "api-blue|api-green"; then
+
+  if awk '/^[[:space:]]*#/{next} /api-blue|api-green/{found=1;exit} END{exit(found?0:1)}' \
+      "${MAINTENANCE_CONFIG}"; then
     log_fail "Maintenance config references backend containers (CRITICAL: maintenance mode must be self-contained)"
   else
     log_pass "Maintenance config has no backend container references"
@@ -206,9 +216,9 @@ log_info "Checking both configs have API_HOSTNAME placeholder..."
 for config in "${ACTIVE_CONFIG}" "${MAINTENANCE_CONFIG}"; do
   if [ -f "${config}" ]; then
     if grep -q "__API_HOSTNAME__" "${config}"; then
-      log_pass "$(basename ${config}) has __API_HOSTNAME__ placeholder"
+      log_pass "$(basename "${config}") has __API_HOSTNAME__ placeholder"
     else
-      log_fail "$(basename ${config}) missing __API_HOSTNAME__ placeholder"
+      log_fail "$(basename "${config}") missing __API_HOSTNAME__ placeholder"
     fi
   fi
 done

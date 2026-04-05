@@ -20,6 +20,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck source=lib-http.sh
+. "${SCRIPT_DIR}/lib-http.sh"
+
 # ---------------------------------------------------------------------------
 # CI vs VPS detection
 # ---------------------------------------------------------------------------
@@ -301,13 +304,16 @@ fi
 log_ok "nginx sync completed"
 
 wait_for_nginx() {
-  local attempt
+  local attempt _code
   log_info "Waiting for nginx liveness..."
   # Use host-side curl against port 80 — more reliable than docker exec + BusyBox
   # wget. curl is already required by this script (binary check above).
+  # curl_http_code enforces --max-redirs 0 and the correct Host header so a
+  # misconfigured nginx block returning 301 is treated as a failure, not success.
   # shellcheck disable=SC2034
   for attempt in $(seq 1 30); do
-    if curl -sf --max-time 3 http://127.0.0.1/infra/health >/dev/null 2>&1; then
+    _code="$(curl_http_code "http://127.0.0.1/infra/health")"
+    if [ "${_code}" = "200" ]; then
       log_ok "nginx ready"
       return 0
     fi
@@ -320,10 +326,11 @@ wait_for_nginx() {
 wait_for_nginx
 
 log_info "Validating host-level nginx /infra/health endpoint..."
-if curl -sf http://localhost/infra/health >/dev/null; then
+_infra_code="$(curl_http_code "http://127.0.0.1/infra/health")"
+if [ "${_infra_code}" = "200" ]; then
   log_ok "Host-level /infra/health probe passed"
 else
-  log_error "Host-level /infra/health probe failed."
+  log_error "Host-level /infra/health probe failed (HTTP ${_infra_code})."
   exit 1
 fi
 

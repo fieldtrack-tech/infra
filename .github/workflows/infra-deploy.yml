@@ -117,18 +117,26 @@ jobs:
       - name: Shellcheck scripts
         run: |
           shellcheck -S warning \
-            scripts/check-contract.sh \
+            scripts/lib-http.sh \
             scripts/bootstrap.sh \
             scripts/nginx-sync.sh \
+            scripts/check-contract.sh \
             scripts/monitoring-sync.sh \
             scripts/render-alertmanager.sh \
             scripts/render-prometheus.sh \
-            scripts/verify-alertmanager.sh
+            scripts/verify-alertmanager.sh \
+            scripts/validate-nginx-configs.sh \
+            scripts/validate-paths.sh \
+            scripts/validate-system.sh \
+            scripts/validate-docker-cli.sh \
+            scripts/validate-secrets.sh
 
   smoke-core:
     name: Smoke Core Infra
     runs-on: ubuntu-24.04
     needs: [validate]
+    env:
+      API_HOSTNAME: api.test.local
 
     steps:
       - uses: actions/checkout@v4
@@ -172,12 +180,17 @@ jobs:
 
       - name: Verify nginx maintenance mode before API
         run: |
-          # Verify nginx infra is alive
-          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health >/dev/null
+          # shellcheck source=scripts/lib-http.sh
+          . scripts/lib-http.sh
+          # Verify nginx is alive (HTTPS /infra/health must return 200)
+          _code="$(curl_https_code "https://${API_HOSTNAME}/infra/health")"
+          [ "${_code}" = "200" ] || { echo "ERROR: /infra/health returned ${_code}"; exit 1; }
           # Verify /health returns 503 in maintenance mode (no backend)
-          test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/health)" = "503"
+          _code="$(curl_https_code "https://${API_HOSTNAME}/health")"
+          [ "${_code}" = "503" ] || { echo "ERROR: /health returned ${_code} (expected 503)"; exit 1; }
           # Verify root returns 503
-          test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)" = "503"
+          _code="$(curl_https_code "https://${API_HOSTNAME}/")"
+          [ "${_code}" = "503" ] || { echo "ERROR: / returned ${_code} (expected 503)"; exit 1; }
 
       - name: Start mock API backend (container name api-green)
         run: |
@@ -219,19 +232,23 @@ jobs:
 
       - name: Verify routed API health
         run: |
-          # Verify nginx infra is alive
-          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health >/dev/null
-          # Verify /health now proxies to backend and returns 200
-          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health >/dev/null
-
-          # ACTIVE MODE: must NOT contain "maintenance"
-          if curl -kfsS -H "Host: api.test.local" https://127.0.0.1/health | grep -q "maintenance"; then
-            echo "ERROR: Active mode /health contains 'maintenance'!"
+          # shellcheck source=scripts/lib-http.sh
+          . scripts/lib-http.sh
+          # Verify nginx is alive
+          _code="$(curl_https_code "https://${API_HOSTNAME}/infra/health")"
+          [ "${_code}" = "200" ] || { echo "ERROR: /infra/health returned ${_code}"; exit 1; }
+          # Verify /health proxies to backend and returns 200
+          _code="$(curl_https_code "https://${API_HOSTNAME}/health")"
+          [ "${_code}" = "200" ] || { echo "ERROR: /health returned ${_code} (expected 200)"; exit 1; }
+          # Active mode: body must NOT contain 'maintenance'
+          _body="$(curl_https_body "https://${API_HOSTNAME}/health")"
+          if printf '%s' "${_body}" | grep -q 'maintenance'; then
+            echo "ERROR: Active mode /health contains 'maintenance'! Body: ${_body}"
             exit 1
           fi
-
           # Verify API content is served
-          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-api'
+          _body="$(curl_https_body "https://${API_HOSTNAME}/")"
+          printf '%s' "${_body}" | grep -q 'mock-api' || { echo "ERROR: / did not return mock-api. Body: ${_body}"; exit 1; }
 
       - name: Verify api-green resolves on api_network
         run: |
@@ -265,15 +282,19 @@ jobs:
           echo "=== Verifying nginx is running ==="
           docker ps | grep nginx
 
+          # shellcheck source=scripts/lib-http.sh
+          . scripts/lib-http.sh
+
           echo "=== Testing nginx /infra/health endpoint ==="
-          curl -kfsS -H "Host: api.test.local" https://127.0.0.1/infra/health || echo "Infra health check failed"
+          _code="$(curl_https_code "https://${API_HOSTNAME}/infra/health")"
+          [ "${_code}" = "200" ] || echo "WARN: /infra/health returned ${_code}"
 
           echo "=== Testing /health endpoint (should be 503 in maintenance) ==="
-          HEALTH_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/health)"
+          HEALTH_CODE="$(curl_https_code "https://${API_HOSTNAME}/health")"
           echo "Health endpoint returned: ${HEALTH_CODE}"
 
           echo "=== Testing maintenance mode response ==="
-          HTTP_CODE="$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)"
+          HTTP_CODE="$(curl_https_code "https://${API_HOSTNAME}/")"
           echo "Received HTTP code: ${HTTP_CODE}"
 
           if [ "${HTTP_CODE}" != "503" ]; then
@@ -356,6 +377,13 @@ jobs:
             set +a
             : "${API_HOSTNAME:?API_HOSTNAME must be set in /opt/infra/.env.monitoring}"
 
+            # Source shared HTTP probe helpers so validate_state uses the same
+            # curl_http_code / curl_https_code / curl_https_body functions as
+            # nginx-sync.sh and bootstrap.sh.  Must come after API_HOSTNAME is
+            # set (functions guard against empty API_HOSTNAME at call time).
+            # shellcheck source=scripts/lib-http.sh
+            . /opt/infra/scripts/lib-http.sh
+
             echo "[deploy] Validating infra completeness..."
             bash scripts/validate-paths.sh || {
               echo "[deploy] ERROR: Infra validation failed"
@@ -397,42 +425,37 @@ jobs:
             echo "[deploy] Deterministic execution controller waiting for convergence limits..."
             validate_state() {
               for i in $(seq 1 10); do
-                 # /infra/health must return 200 in both modes.
-                 # Use HTTP with explicit Host header (same as probe_nginx_liveness
-                 # in nginx-sync). The HTTP block has `location = /infra/health`
-                 # that returns 200 directly — no redirect, no backend needed.
-                 # Using HTTPS here caused failures because stale nginx workers
-                 # from previous deploys served HTTPS with an old config that
-                 # lacked this location block, returning 503 via a catch-all.
-                 INFRA_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-                   --max-time 5 \
-                   -H "Host: ${API_HOSTNAME}" \
-                   http://127.0.0.1/infra/health || echo "000")"
+                 # --- Check 1: nginx config correctness (infra invariant) ---
+                 # /infra/health is served by nginx with no backend involvement.
+                 # A 200 here proves the correct config is loaded (has the
+                 # location block), the correct server block is active, and
+                 # there is no redirect loop (--max-redirs 0 treats 301 as
+                 # failure, unlike curl -f which silently accepts 3xx).
+                 # Retried 3 times to allow for container startup jitter.
+                 INFRA_CODE="000"
+                 for _r in 1 2 3; do
+                   INFRA_CODE="$(curl_http_code "http://127.0.0.1/infra/health")"
+                   [ "${INFRA_CODE}" = "200" ] && break
+                   sleep 1
+                 done
 
-                 # /health behaviour differs by mode and protocol:
-                 #   Active mode HTTP  → 301 redirect to HTTPS (intentional)
-                 #   Active mode HTTPS → 200 proxied from backend
-                 #   Maintenance HTTP  → 503 static response
-                 #   Maintenance HTTPS → 503 static response
-                 # Use HTTPS with -k (self-signed cert on VPS) so both modes
-                 # return the definitive status code without redirect ambiguity.
-                 HEALTH_CODE="$(curl -ks -o /dev/null -w "%{http_code}" --resolve "${API_HOSTNAME}:443:127.0.0.1" "https://${API_HOSTNAME}/health" || echo "000")"
-                 HEALTH_BODY="$(curl -ks --resolve "${API_HOSTNAME}:443:127.0.0.1" "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+                 # --- Check 2: routing correctness (app health) ---
+                 # /health via HTTPS is unambiguous in every mode:
+                 #   Active mode  → 200  (proxied to backend)
+                 #   Maintenance  → 503  (static return from maintenance config)
+                 HEALTH_CODE="$(curl_https_code "https://${API_HOSTNAME}/health")"
+                 HEALTH_BODY="$(curl_https_body "https://${API_HOSTNAME}/health")"
 
                  MATCH=1
                  if [ "${INFRA_CODE}" != "200" ]; then MATCH=0; fi
 
-                 # Use container presence (not slot file) to determine expected mode.
-                 # Slot-file routing was removed; health-based routing is canonical.
                  if docker ps --format '{{.Names}}' | grep -qE '^api-(blue|green)$'; then
-                   # At least one API container is running: active mode expected.
-                   # HTTPS /health must return 200 and must NOT contain 'maintenance'.
+                   # API container running → active mode expected.
                    if [ "${HEALTH_CODE}" != "200" ] || echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
                      MATCH=0
                    fi
                  else
-                   # No API containers running: maintenance mode expected.
-                   # HTTPS /health must return 503 and body must contain 'maintenance'.
+                   # No API container → maintenance mode expected.
                    if [ "${HEALTH_CODE}" != "503" ] || ! echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
                      MATCH=0
                    fi

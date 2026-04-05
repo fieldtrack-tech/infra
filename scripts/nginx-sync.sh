@@ -30,6 +30,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck source=lib-http.sh
+. "${SCRIPT_DIR}/lib-http.sh"
+
 # ---------------------------------------------------------------------------
 # Path validation
 #
@@ -288,41 +291,33 @@ wait_for_nginx_running() {
 }
 
 # ---------------------------------------------------------------------------
-# HTTP probes — all run on the HOST using curl, NOT inside the nginx container.
+# HTTP/HTTPS probes — all run on the HOST using curl, NOT inside the nginx
+# container.  All curl invocations go through lib-http.sh helpers which
+# enforce --connect-timeout, --max-time, --max-redirs 0, correct Host/SNI,
+# and a "000" sentinel on error.  See lib-http.sh for full rationale.
 #
-# Rationale: the nginx container runs Alpine with BusyBox wget. BusyBox wget:
-#   - Does not guarantee a clean 3-digit status code from `wget -S` output
-#     (CRLF line endings, format varies across BusyBox versions)
-#   - Does NOT write the response body to stdout for non-2xx responses when
-#     the shell `|| echo ""` pattern is used (exit-code propagation)
-#   - The `--spider` option exits non-zero for anything outside 2xx/3xx,
-#     but gives no HTTP status code to parse
-#
-# curl on the host (Ubuntu CI / Debian VPS) is deterministic:
-#   `curl -s -o /dev/null -w "%{http_code}"` always emits exactly 3 digits
-#   `curl -s` emits the full response body regardless of HTTP status code
+# BusyBox wget (inside the Alpine nginx container) is intentionally avoided:
+#   - No guaranteed 3-digit status code from `wget -S` output
+#   - No response body for non-2xx when using `|| echo ""`
+#   - `--spider` gives no HTTP status code to parse
 # ---------------------------------------------------------------------------
 probe_nginx_liveness() {
   # /infra/health is answered by nginx directly — never depends on backend.
-  # Use -f (--fail) so curl exits non-zero for any non-2xx response.
-  curl -sf --max-time 5 \
-    -H "Host: ${API_HOSTNAME}" \
-    http://127.0.0.1/infra/health >/dev/null 2>&1
+  # curl_http_code enforces all safety invariants; see lib-http.sh.
+  local _code
+  _code="$(curl_http_code "http://127.0.0.1/infra/health")"
+  [ "${_code}" = "200" ]
 }
 
 probe_route_through_nginx() {
-  # HTTPS probe: use --resolve to route to 127.0.0.1 while sending correct
-  # SNI/Host. -k skips cert verification (self-signed on VPS; CI uses self-signed).
-  # -f exits non-zero for 4xx/5xx so the caller can detect failures.
-  curl -sf --max-time 10 -k \
-    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-    "https://${API_HOSTNAME}/health" >/dev/null 2>&1
+  # /health via HTTPS must return 200 when a backend is healthy.
+  # curl_https_code enforces --resolve (correct SNI), -k, --max-redirs 0;
+  # explicit 200 check is stricter than curl -f (which accepts any < 400).
+  [ "$(curl_https_code "https://${API_HOSTNAME}/health")" = "200" ]
 }
 
 probe_ready_through_nginx() {
-  curl -sf --max-time 10 -k \
-    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-    "https://${API_HOSTNAME}/ready" >/dev/null 2>&1
+  [ "$(curl_https_code "https://${API_HOSTNAME}/ready")" = "200" ]
 }
 
 run_probe_with_retries() {
@@ -367,11 +362,18 @@ backend_is_usable() {
 }
 
 restart_nginx() {
-  # Full container restart — guaranteed to start fresh workers reading the
-  # current config file. This is more reliable than `nginx -s reload` which
-  # only sends HUP and can leave stale worker generations from previous failed
-  # deploys/rollbacks still answering requests with an old config version.
-  (cd "${INFRA_DIR}" && docker compose -f docker-compose.nginx.yml restart nginx) >/dev/null 2>&1
+  # Force-recreate the nginx container instead of restarting it.
+  #
+  # `docker compose restart` only stops and starts the EXISTING container —
+  # it does not recreate it. If the container was created with stale settings
+  # or if Docker has cached state, the restarted container may not reflect
+  # the current bind-mount contents as expected.
+  #
+  # `docker compose up -d --force-recreate` removes the old container and
+  # creates a fresh one from the current compose file. The fresh container
+  # is guaranteed to have the correct bind mounts and to start nginx from
+  # scratch reading the current config file on the host filesystem.
+  (cd "${INFRA_DIR}" && docker compose -f docker-compose.nginx.yml up -d --force-recreate nginx) >/dev/null 2>&1
 }
 
 apply_nginx_config() {
@@ -613,10 +615,7 @@ log_ok "Nginx is responsive"
 # Verify /infra/health specifically (needed for post-mode checks below).
 # probe_nginx_liveness already hit this endpoint, but we also need the HTTP
 # status code for the explicit 200 assertion.
-INFRA_HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-  --max-time 5 \
-  -H "Host: ${API_HOSTNAME}" \
-  http://127.0.0.1/infra/health 2>/dev/null || echo "000")"
+INFRA_HEALTH_CODE="$(curl_http_code "http://127.0.0.1/infra/health")"
 if [ "${INFRA_HEALTH_CODE}" != "200" ]; then
   log_warn "/infra/health returned ${INFRA_HEALTH_CODE}; retrying..."
   if ! run_probe_with_retries "Infra health retry" probe_nginx_liveness; then
@@ -639,15 +638,9 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   # indistinguishable from a real failure. HTTPS is unambiguous:
   #   - Active config (old worker, dead backend) → 502
   #   - Maintenance config (new worker)          → 503  ← expected
-  # curl -s outputs the body even for non-2xx responses.
-  HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-    --max-time 5 -k \
-    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
-  HEALTH_BODY="$(curl -s \
-    --max-time 5 -k \
-    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+  # curl_https_code / curl_https_body enforce all safety invariants.
+  HEALTH_CODE="$(curl_https_code "https://${API_HOSTNAME}/health")"
+  HEALTH_BODY="$(curl_https_body "https://${API_HOSTNAME}/health")"
 
   # Allow convergence: after a reload, nginx workers transition gradually.
   # Retry up to 3 times with 1s sleep before treating a non-503 as fatal.
@@ -656,14 +649,8 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
     _retry_ok=false
     for _i in 1 2 3; do
       sleep 1
-      HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-        --max-time 5 -k \
-        --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-        "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
-      HEALTH_BODY="$(curl -s \
-        --max-time 5 -k \
-        --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-        "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+      HEALTH_CODE="$(curl_https_code "https://${API_HOSTNAME}/health")"
+      HEALTH_BODY="$(curl_https_body "https://${API_HOSTNAME}/health")"
       if [ "${HEALTH_CODE}" = "503" ]; then
         _retry_ok=true
         break
@@ -682,10 +669,7 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   # Guard against empty body (transient network/timing issue) with one retry.
   if [ -z "${HEALTH_BODY}" ]; then
     log_warn "Empty response body for maintenance /health; retrying..."
-    HEALTH_BODY="$(curl -s \
-      --max-time 5 -k \
-      --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-      "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+    HEALTH_BODY="$(curl_https_body "https://${API_HOSTNAME}/health")"
   fi
   if ! printf '%s' "${HEALTH_BODY}" | grep -q 'maintenance'; then
     log_error "CRITICAL: Maintenance /health response body does not contain 'maintenance'"
