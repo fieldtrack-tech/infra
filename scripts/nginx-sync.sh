@@ -545,22 +545,33 @@ fi
 # Allow nginx to finish spawning new workers with the reloaded config before
 # probing. `nginx -s reload` sends HUP and returns immediately; there is a
 # brief window where old workers (running the previous config) still answer
-# requests. 1 second is sufficient for nginx to complete the transition in
-# both CI and production environments.
-sleep 1
+# requests. 2 seconds provides the initial margin; post-reload probes also
+# include retry logic to handle stale workers running a config that predates
+# newer location blocks (e.g. /infra/health added after original deployment).
+sleep 2
 
 # Post-reload validation: Verify nginx is responding correctly
 log_info "Validating nginx responses match expected mode..."
 
-# Always verify /infra/health works (nginx liveness)
-# curl -s -o /dev/null -w "%{http_code}" always yields exactly 3 decimal digits
-# with no CRLF, no extra text — safe for direct string comparison.
-INFRA_HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-  --max-time 5 \
-  -H "Host: ${API_HOSTNAME}" \
-  http://127.0.0.1/infra/health 2>/dev/null || echo "000")"
+# Always verify /infra/health works (nginx liveness).
+# Retry up to 3 times with 2s sleep between: nginx -s reload is async and
+# old workers (possibly running a config that predates the /infra/health
+# location block) can still answer requests while new workers spin up.
+# Retrying ensures we eventually reach a new worker serving the updated config.
+INFRA_HEALTH_CODE="000"
+for _infra_attempt in 1 2 3; do
+  INFRA_HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 5 \
+    -H "Host: ${API_HOSTNAME}" \
+    http://127.0.0.1/infra/health 2>/dev/null || echo "000")"
+  [ "${INFRA_HEALTH_CODE}" = "200" ] && break
+  if [ "${_infra_attempt}" -lt 3 ]; then
+    log_info "/infra/health attempt ${_infra_attempt} returned ${INFRA_HEALTH_CODE}; retrying in 2s..."
+    sleep 2
+  fi
+done
 if [ "${INFRA_HEALTH_CODE}" != "200" ]; then
-  log_error "CRITICAL: /infra/health returned ${INFRA_HEALTH_CODE} (expected 200)"
+  log_error "CRITICAL: /infra/health returned ${INFRA_HEALTH_CODE} after 3 attempts (expected 200)"
   rollback_live_config
   exit 1
 fi
@@ -579,14 +590,25 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   #   - Active config (old worker, dead backend) → 502
   #   - Maintenance config (new worker)          → 503  ← expected
   # curl -s outputs the body even for non-2xx responses.
-  HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-    --max-time 5 -k \
-    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
-  HEALTH_BODY="$(curl -s \
-    --max-time 5 -k \
-    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+  # Retry up to 3 times: same stale-worker race applies here — old workers may
+  # answer HTTPS before new workers with the maintenance config take over.
+  HEALTH_CODE="000"
+  HEALTH_BODY=""
+  for _maint_attempt in 1 2 3; do
+    HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+      --max-time 5 -k \
+      --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+      "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
+    HEALTH_BODY="$(curl -s \
+      --max-time 5 -k \
+      --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+      "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
+    [ "${HEALTH_CODE}" = "503" ] && break
+    if [ "${_maint_attempt}" -lt 3 ]; then
+      log_info "Maintenance /health attempt ${_maint_attempt} returned ${HEALTH_CODE}; retrying in 2s..."
+      sleep 2
+    fi
+  done
 
   if [ "${HEALTH_CODE}" = "503" ]; then
     log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
