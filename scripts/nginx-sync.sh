@@ -375,22 +375,21 @@ restart_nginx() {
 }
 
 apply_nginx_config() {
-  # Strategy: try a graceful in-process reload first (zero downtime); fall
-  # back to a full container restart only if the reload fails. This minimises
-  # the window where no worker is listening while keeping the guarantee that
-  # the new config is always picked up cleanly.
+  # Always do a full container restart. Never use `nginx -s reload`.
   #
-  # `nginx -t` is run against the file inside the container (the live bind
-  # mount) so the result reflects exactly what nginx will load on reload.
-  if docker exec nginx nginx -t >/dev/null 2>&1; then
-    if docker exec nginx nginx -s reload >/dev/null 2>&1; then
-      log_info "nginx config reloaded in-process (graceful)"
-      return 0
-    fi
-    log_warn "nginx -s reload returned non-zero; falling back to container restart"
-  else
-    log_warn "nginx -t failed inside container; falling back to container restart"
-  fi
+  # Why: `nginx -s reload` sends HUP to the master, which forks new workers
+  # and tells old workers to finish in-flight requests and exit. In practice,
+  # on a VPS that has run many deploy/rollback cycles, old workers accumulate
+  # — they serve connections for the remainder of their keepalive timeout
+  # (default 75s) and nginx does not force-kill them. Each deploy adds another
+  # generation of old workers. Workers from config versions that predate the
+  # `location = /infra/health` block return 301 for that path, causing
+  # validate_state() to fail even minutes after a successful reload.
+  #
+  # `docker compose restart nginx` sends SIGTERM to the container, which nginx
+  # handles by gracefully shutting down all workers before exiting. The fresh
+  # container starts with exactly one generation of workers reading the current
+  # bind-mounted config. Zero stale workers, zero stale configs, zero 301s.
   restart_nginx
 }
 
