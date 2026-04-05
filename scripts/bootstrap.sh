@@ -223,14 +223,6 @@ if [ "${IS_CI}" != "true" ]; then
   fi
 fi
 
-# Confirm nginx-sync can write its log before we invoke it
-log_info "Pre-flight: verifying LOG_DIR=${LOG_DIR} is writable for nginx-sync..."
-if ! touch "${LOG_DIR}/nginx-sync.log" 2>/dev/null; then
-  log_error "Cannot write to ${LOG_DIR}/nginx-sync.log — aborting before nginx-sync"
-  exit 1
-fi
-log_ok "LOG_DIR writable"
-
 log_info "Pre-flight: verifying STATE_DIR=${STATE_DIR} is writable..."
 if ! touch "${STATE_DIR}/.write-test" 2>/dev/null; then
   log_error "Cannot write to ${STATE_DIR} — aborting before nginx-sync"
@@ -292,7 +284,7 @@ validate_redis_network
 # ---------------------------------------------------------------------------
 log_info "Syncing nginx (health-based routing)..."
 
-# Export so nginx-sync uses the same paths
+# Export for watchdog cron and other tooling that expect these paths
 export LOG_DIR STATE_DIR
 
 if ! bash "${SCRIPT_DIR}/nginx-sync.sh"; then
@@ -401,4 +393,4 @@ fi
 
 log_info ""
 log_info "Bootstrap complete. System is ready for API deployment."
-log_info "Nginx is configured and will serve maintenance mode until first healthy API slot."
+log_info "Nginx is configured and will serve maintenance mode until the API container is healthy on api_network."

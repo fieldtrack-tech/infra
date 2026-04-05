@@ -150,7 +150,7 @@ assert_contains "scripts/bootstrap.sh" "STATE_DIR=\"/var/lib/fieldtrack\""
 log_ok "Bootstrap script documents canonical defaults"
 
 # Ensure nginx-sync.sh no longer references legacy slot-file names
-if grep -Fq "active-slot" "scripts/nginx-sync.sh" 2>/dev/null || true; then
+if grep -Fq "active-slot" "scripts/nginx-sync.sh" 2>/dev/null; then
   log_error "scripts/nginx-sync.sh must not reference active-slot (slot-based routing was removed)"
   exit 1
 fi
