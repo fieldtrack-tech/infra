@@ -366,11 +366,19 @@ backend_is_usable() {
   run_probe_with_retries "Direct backend probe for ${container_name}" probe_backend_direct "${container_name}"
 }
 
+restart_nginx() {
+  # Full container restart — guaranteed to start fresh workers reading the
+  # current config file. This is more reliable than `nginx -s reload` which
+  # only sends HUP and can leave stale worker generations from previous failed
+  # deploys/rollbacks still answering requests with an old config version.
+  (cd "${INFRA_DIR}" && docker compose -f docker-compose.nginx.yml restart nginx) >/dev/null 2>&1
+}
+
 rollback_live_config() {
   if [ -n "${BACKUP_FILE:-}" ] && [ -f "${BACKUP_FILE}" ]; then
     cp "${BACKUP_FILE}" "${OUTPUT_FILE}"
     if docker inspect nginx >/dev/null 2>&1; then
-      docker exec nginx nginx -s reload >/dev/null 2>&1 || true
+      restart_nginx || true
     fi
     log_info "Rolled back to ${BACKUP_FILE}"
   else
@@ -546,15 +554,27 @@ mv "${TEMP_CONF_DIR}/api.conf" "${OUTPUT_FILE}"
 log_ok "Config written atomically -> ${OUTPUT_FILE}"
 
 if docker ps --format '{{.Names}}' | grep -qx 'nginx'; then
-  log_info "Reloading nginx..."
-  if ! docker exec nginx nginx -s reload >/dev/null; then
-    log_error "nginx reload failed. Rolling back..."
+  log_info "Restarting nginx to apply new config..."
+  # Use a full container restart rather than `nginx -s reload`.
+  # nginx -s reload sends HUP and exits immediately; the master then forks
+  # new workers and only asks old workers to drain — but old workers continue
+  # serving new connections until new workers are ready. On a VPS that has
+  # gone through multiple failed deploy/rollback cycles this leaves stale
+  # worker generations running old configs indefinitely. A container restart
+  # kills all processes and starts a fresh nginx that reads the current
+  # config file from the bind mount from the very first request.
+  if ! restart_nginx; then
+    log_error "nginx restart failed. Rolling back..."
     rollback_live_config
     exit 1
   fi
 else
   log_info "Starting nginx..."
-  docker compose -f "${NGINX_COMPOSE_FILE}" up -d nginx >/dev/null
+  if ! (cd "${INFRA_DIR}" && docker compose -f docker-compose.nginx.yml up -d nginx) >/dev/null; then
+    log_error "nginx start failed. Rolling back..."
+    rollback_live_config
+    exit 1
+  fi
 fi
 
 if ! wait_for_nginx_running; then
@@ -563,36 +583,21 @@ if ! wait_for_nginx_running; then
   exit 1
 fi
 
-# Allow nginx to finish spawning new workers with the reloaded config before
-# probing. `nginx -s reload` sends HUP and returns immediately; there is a
-# brief window where old workers (running the previous config) still answer
-# requests. 2 seconds provides the initial margin; post-reload probes also
-# include retry logic to handle stale workers running a config that predates
-# newer location blocks (e.g. /infra/health added after original deployment).
-sleep 2
-
 # Post-reload validation: Verify nginx is responding correctly
 log_info "Validating nginx responses match expected mode..."
 
-# Always verify /infra/health works (nginx liveness).
-# Retry up to 3 times with 2s sleep between: nginx -s reload is async and
-# old workers (possibly running a config that predates the /infra/health
-# location block) can still answer requests while new workers spin up.
-# Retrying ensures we eventually reach a new worker serving the updated config.
-INFRA_HEALTH_CODE="000"
-for _infra_attempt in 1 2 3; do
-  INFRA_HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-    --max-time 5 \
-    -H "Host: ${API_HOSTNAME}" \
-    http://127.0.0.1/infra/health 2>/dev/null || echo "000")"
-  [ "${INFRA_HEALTH_CODE}" = "200" ] && break
-  if [ "${_infra_attempt}" -lt 3 ]; then
-    log_info "/infra/health attempt ${_infra_attempt} returned ${INFRA_HEALTH_CODE}; retrying in 2s..."
-    sleep 2
-  fi
-done
+# Verify /infra/health works (nginx liveness).
+# A brief sleep gives the fresh nginx container time to bind ports after
+# the container restart; wait_for_nginx_running already confirmed the
+# container is in 'running' state but the listener may not be ready yet.
+sleep 1
+INFRA_HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+  --max-time 5 \
+  -H "Host: ${API_HOSTNAME}" \
+  http://127.0.0.1/infra/health 2>/dev/null || echo "000")"
 if [ "${INFRA_HEALTH_CODE}" != "200" ]; then
-  log_error "CRITICAL: /infra/health returned ${INFRA_HEALTH_CODE} after 3 attempts (expected 200)"
+  log_error "CRITICAL: /infra/health returned ${INFRA_HEALTH_CODE} (expected 200)"
+  log_error "Container restart completed but nginx is not responding — check docker logs nginx"
   rollback_live_config
   exit 1
 fi
@@ -611,25 +616,14 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   #   - Active config (old worker, dead backend) → 502
   #   - Maintenance config (new worker)          → 503  ← expected
   # curl -s outputs the body even for non-2xx responses.
-  # Retry up to 3 times: same stale-worker race applies here — old workers may
-  # answer HTTPS before new workers with the maintenance config take over.
-  HEALTH_CODE="000"
-  HEALTH_BODY=""
-  for _maint_attempt in 1 2 3; do
-    HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-      --max-time 5 -k \
-      --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-      "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
-    HEALTH_BODY="$(curl -s \
-      --max-time 5 -k \
-      --resolve "${API_HOSTNAME}:443:127.0.0.1" \
-      "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
-    [ "${HEALTH_CODE}" = "503" ] && break
-    if [ "${_maint_attempt}" -lt 3 ]; then
-      log_info "Maintenance /health attempt ${_maint_attempt} returned ${HEALTH_CODE}; retrying in 2s..."
-      sleep 2
-    fi
-  done
+  HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 5 -k \
+    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
+  HEALTH_BODY="$(curl -s \
+    --max-time 5 -k \
+    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
 
   if [ "${HEALTH_CODE}" = "503" ]; then
     log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
