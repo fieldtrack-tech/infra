@@ -542,6 +542,13 @@ if ! wait_for_nginx_running; then
   exit 1
 fi
 
+# Allow nginx to finish spawning new workers with the reloaded config before
+# probing. `nginx -s reload` sends HUP and returns immediately; there is a
+# brief window where old workers (running the previous config) still answer
+# requests. 1 second is sufficient for nginx to complete the transition in
+# both CI and production environments.
+sleep 1
+
 # Post-reload validation: Verify nginx is responding correctly
 log_info "Validating nginx responses match expected mode..."
 
@@ -561,26 +568,33 @@ log_ok "/infra/health correctly returns 200 (nginx is alive)"
 
 if [ "${ROUTING_MODE}" = "maintenance" ]; then
   # In maintenance mode, /health must return 503 with a body containing 'maintenance'.
-  # IMPORTANT: use plain HTTP (port 80) — the maintenance HTTP block serves 503
-  # directly without redirecting (only the root '/' redirects to HTTPS).
-  # curl -s outputs the body even for non-2xx responses (unlike BusyBox wget).
+  # Use HTTPS (same as all other probes in this script) via --resolve so curl
+  # reaches 127.0.0.1 while sending the correct SNI/Host. -k skips cert
+  # verification (self-signed in CI and on VPS before Let's Encrypt runs).
+  #
+  # Why NOT plain HTTP: the active config's HTTP server block has
+  # `location = /health { return 301 ... }`. If the post-reload probe races
+  # against a still-running old worker, HTTP returns 301 which is
+  # indistinguishable from a real failure. HTTPS is unambiguous:
+  #   - Active config (old worker, dead backend) → 502
+  #   - Maintenance config (new worker)          → 503  ← expected
+  # curl -s outputs the body even for non-2xx responses.
   HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-    --max-time 5 \
-    -H "Host: ${API_HOSTNAME}" \
-    http://127.0.0.1/health 2>/dev/null || echo "000")"
+    --max-time 5 -k \
+    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "000")"
   HEALTH_BODY="$(curl -s \
-    --max-time 5 \
-    -H "Host: ${API_HOSTNAME}" \
-    http://127.0.0.1/health 2>/dev/null || echo "")"
+    --max-time 5 -k \
+    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+    "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
 
-  if [ "${HEALTH_CODE}" = "502" ]; then
-    log_error "CRITICAL: Maintenance /health returned 502 (backend resolution failure)"
-    log_error "This means nginx is trying to proxy to a backend that does not exist"
-    log_error "Config is in maintenance mode but still has proxy_pass — template issue"
+  if [ "${HEALTH_CODE}" = "503" ]; then
+    log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
+  elif [ "${HEALTH_CODE}" = "502" ]; then
+    log_error "CRITICAL: Maintenance /health returned 502"
+    log_error "Nginx is still proxying /health to the dead backend — maintenance template has proxy_pass"
     rollback_live_config
     exit 1
-  elif [ "${HEALTH_CODE}" = "503" ]; then
-    log_ok "Maintenance /health correctly returns 503 (no healthy backend)"
   elif [ "${HEALTH_CODE}" = "200" ]; then
     log_error "CRITICAL: Maintenance /health returned 200 (should be 503)"
     log_error "This masks the fact that no backend is available"
@@ -588,6 +602,7 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
     exit 1
   else
     log_error "CRITICAL: Maintenance /health returned unexpected code: ${HEALTH_CODE} (expected 503)"
+    log_error "Probe: HTTPS ${API_HOSTNAME}/health via --resolve to 127.0.0.1"
     rollback_live_config
     exit 1
   fi
