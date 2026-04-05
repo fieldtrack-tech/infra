@@ -30,9 +30,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Validate we're running from the expected location
+# ---------------------------------------------------------------------------
+# Path validation
+#
+# On production the repo must live at /opt/infra so that all tooling
+# (watchdog cron, deploy scripts, container volume mounts) agree on one
+# canonical path.  In CI (GitHub Actions sets CI=true automatically)
+# the workspace is /home/runner/work/<repo>/<repo> — this is the correct
+# and expected path for CI; no warning is needed or useful there.
+# ---------------------------------------------------------------------------
 EXPECTED_INFRA_ROOT="/opt/infra"
-if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
+if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ] && [ "${CI:-false}" != "true" ]; then
   echo "[nginx-sync] WARN  Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}" >&2
   echo "[nginx-sync] WARN  For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}" >&2
 fi
@@ -48,41 +56,6 @@ log_info()  { printf '[nginx-sync] INFO  %s\n' "$*"; }
 log_warn()  { printf '[nginx-sync] WARN  %s\n' "$*" >&2; }
 log_error() { printf '[nginx-sync] ERROR %s\n' "$*" >&2; }
 log_ok()    { printf '[nginx-sync] OK    %s\n' "$*"; }
-
-# ---------------------------------------------------------------------------
-# Mutual-exclusion lock — prevents concurrent cron + deploy executions from
-# writing conflicting configs to nginx/live/. Uses an atomic mkdir + PID file
-# so it works correctly under set -e and in all environments (no flock/exec).
-#
-# Why NOT flock + exec N>file:
-#   In bash with set -euo pipefail, `exec N>file` is a bare statement subject
-#   to set -e. If the redirect fails for any reason (permission, FD limit, CI
-#   sandbox restrictions), bash exits 1 immediately and silently — producing
-#   no further log output. This is not recoverable without disabling set -e.
-#
-# The mkdir approach is POSIX-portable and always safe under set -e because:
-#   - `mkdir` success/failure is tested via `if ! mkdir`, which set -e ignores
-#   - No file descriptor manipulation required
-#   - Stale locks are handled via PID liveness check
-# ---------------------------------------------------------------------------
-LOCK_DIR="${TMPDIR:-/tmp}/nginx-sync.lck"
-if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-  LOCK_PID=""
-  [ -f "${LOCK_DIR}/pid" ] && LOCK_PID="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
-  if [ -n "${LOCK_PID}" ] && kill -0 "${LOCK_PID}" 2>/dev/null; then
-    log_warn "Another nginx-sync is already running (PID ${LOCK_PID}). Exiting to avoid concurrent execution."
-    exit 0
-  fi
-  # Stale lock: the owning process is gone — clean up and re-acquire
-  log_info "Removing stale lock (PID ${LOCK_PID:-unknown} is no longer running)"
-  rm -rf "${LOCK_DIR}"
-  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-    log_warn "Could not acquire exclusive lock at ${LOCK_DIR}; proceeding without mutual exclusion"
-  fi
-fi
-printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
-# Lock directory is removed on exit by the cleanup() function defined below
-# (cleanup() is set up after mktemp and covers both LOCK_DIR and TEMP_CONF_DIR).
 
 ALLOW_MISSING_BACKEND=false
 SELECTED_CONTAINER=""
@@ -265,14 +238,23 @@ backend_matches_expected_sha() {
 
 validate_candidate_config() {
   local candidate_dir="$1"
-
-  docker run --rm \
+  # Run nginx -t WITHOUT >/dev/null so any syntax errors are always visible
+  # in CI logs. nginx sends its output to stderr by default; we capture both
+  # stdout+stderr and prefix each line so it's easy to spot in the job log.
+  local output
+  if ! output="$(docker run --rm \
     -v "${candidate_dir}:/etc/nginx/conf.d:ro" \
     -v /etc/ssl/api:/etc/ssl/api:ro \
     -v /var/www/certbot:/var/www/certbot:ro \
     -v /var/log/nginx:/var/log/nginx \
     nginx:1.25-alpine \
-    nginx -t >/dev/null
+    nginx -t 2>&1)"; then
+    log_error "nginx -t config validation failed:"
+    printf '%s\n' "${output}" | sed 's/^/  [nginx-t] /' >&2
+    return 1
+  fi
+  # Print nginx -t output at INFO level even on success (shows 'test is successful')
+  printf '%s\n' "${output}" | sed 's/^/  [nginx-t] /'
 }
 
 probe_backend_direct() {
@@ -406,6 +388,7 @@ rollback_live_config() {
 }
 
 mkdir -p "${LIVE_DIR}" "${BACKUP_DIR}"
+log_info "Directories ready: ${LIVE_DIR}, ${BACKUP_DIR}"
 
 resolve_backend_container
 
@@ -424,10 +407,13 @@ else
   fi
 fi
 
-TEMP_CONF_DIR="$(mktemp -d)"
+# Create the temp dir INSIDE LIVE_DIR so that the final mv is within the same
+# filesystem — POSIX guarantees rename(2) is atomic only within one filesystem.
+# If we used /tmp (the mktemp default), mv across a filesystem boundary would
+# silently fall back to a copy+delete, which is NOT atomic.
+TEMP_CONF_DIR="$(mktemp -d "${LIVE_DIR}/tmp.XXXXXXXXXX")"
 cleanup() {
   rm -rf "${TEMP_CONF_DIR}" 2>/dev/null || true
-  rm -rf "${LOCK_DIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -526,8 +512,12 @@ if [ -f "${OUTPUT_FILE}" ]; then
   log_info "Backed up existing config -> ${BACKUP_FILE}"
 fi
 
-cp "${TEMP_CONF_DIR}/api.conf" "${OUTPUT_FILE}"
-log_ok "Config rendered -> ${OUTPUT_FILE}"
+# Atomic rename: mv within the same filesystem is POSIX-guaranteed atomic.
+# This means nginx never reads a half-written config during a hot reload —
+# it sees either the old file or the new file, never a partial write.
+# (Using cp instead would leave a window where nginx could reload mid-write.)
+mv "${TEMP_CONF_DIR}/api.conf" "${OUTPUT_FILE}"
+log_ok "Config written atomically -> ${OUTPUT_FILE}"
 
 if docker ps --format '{{.Names}}' | grep -qx 'nginx'; then
   log_info "Reloading nginx..."

@@ -112,23 +112,30 @@ log_info "Bootstrapping log directory: ${LOG_DIR}"
 ensure_directory_ready "${LOG_DIR}"
 
 # ---------------------------------------------------------------------------
-# Step 1: Infra location check (warn only — supports CI checkout paths)
+# Step 1: Infra location check (VPS only — CI always runs from the runner workspace)
+# ---------------------------------------------------------------------------
+# On VPS the repo MUST be at /opt/infra so watchdog cron, deploy scripts, and
+# nginx volume mounts all agree on one canonical path.
+# In CI (GitHub Actions sets CI=true) the workspace is under /home/runner/work/
+# which is the correct and expected path — no action or warning needed there.
+# git clone https://github.com/fieldtrack-tech/infra.git /opt/infra
+#   → files land AT /opt/infra (not /opt/infra/<reponame>), which is canonical.
 # ---------------------------------------------------------------------------
 EXPECTED_INFRA_ROOT="/opt/infra"
-if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ]; then
+if [ "${INFRA_DIR}" != "${EXPECTED_INFRA_ROOT}" ] && [ "${IS_CI}" != "true" ]; then
   log_warn "Running from ${INFRA_DIR} instead of ${EXPECTED_INFRA_ROOT}"
-  if [ "${IS_CI}" != "true" ]; then
-    log_warn "For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}"
+  log_warn "For production, infra should be cloned to ${EXPECTED_INFRA_ROOT}"
 
-    # Ensure /opt/infra exists on VPS
-    if [ ! -d "${EXPECTED_INFRA_ROOT}" ]; then
-      ensure_directory_ready "${EXPECTED_INFRA_ROOT}"
-    fi
+  # Ensure /opt/infra exists on VPS
+  if [ ! -d "${EXPECTED_INFRA_ROOT}" ]; then
+    ensure_directory_ready "${EXPECTED_INFRA_ROOT}"
+  fi
 
-    # Clone repo to canonical path if not present
-    if [ ! -d "${EXPECTED_INFRA_ROOT}/.git" ]; then
-      git clone https://github.com/fieldtrack-tech/infra.git "${EXPECTED_INFRA_ROOT}"
-    fi
+  # Clone repo to canonical path if not present.
+  # Note: `git clone <url> /opt/infra` places all repo files DIRECTLY inside
+  # /opt/infra (not in a subdirectory /opt/infra/<reponame>).
+  if [ ! -d "${EXPECTED_INFRA_ROOT}/.git" ]; then
+    git clone https://github.com/fieldtrack-tech/infra.git "${EXPECTED_INFRA_ROOT}"
   fi
 fi
 
