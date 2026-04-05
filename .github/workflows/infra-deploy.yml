@@ -398,12 +398,16 @@ jobs:
             validate_state() {
               for i in $(seq 1 10); do
                  # /infra/health must return 200 in both modes.
-                 # Use HTTPS with --resolve (same pattern as all other probes):
-                 # avoids the HTTP-to-HTTPS redirect that the active config's
-                 # HTTP server block applies to non-exact paths, and avoids
-                 # Host-header mismatch when curl defaults to Host: localhost
-                 # while the nginx server_name is the real API hostname.
-                 INFRA_CODE="$(curl -ks -o /dev/null -w "%{http_code}" --resolve "${API_HOSTNAME}:443:127.0.0.1" "https://${API_HOSTNAME}/infra/health" || echo "000")"
+                 # Use HTTP with explicit Host header (same as probe_nginx_liveness
+                 # in nginx-sync). The HTTP block has `location = /infra/health`
+                 # that returns 200 directly — no redirect, no backend needed.
+                 # Using HTTPS here caused failures because stale nginx workers
+                 # from previous deploys served HTTPS with an old config that
+                 # lacked this location block, returning 503 via a catch-all.
+                 INFRA_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+                   --max-time 5 \
+                   -H "Host: ${API_HOSTNAME}" \
+                   http://127.0.0.1/infra/health || echo "000")"
 
                  # /health behaviour differs by mode and protocol:
                  #   Active mode HTTP  → 301 redirect to HTTPS (intentional)
