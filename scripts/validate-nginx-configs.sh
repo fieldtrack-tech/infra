@@ -59,7 +59,7 @@ fi
 log_info "Checking maintenance config status codes..."
 
 if grep -q 'location = /infra/health' "${MAINTENANCE_CONFIG}"; then
-  if grep -A 3 'location = /infra/health' "${MAINTENANCE_CONFIG}" | grep -q 'return 200'; then
+  if awk '/location = \/infra\/health/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 200'; then
     log_pass "Maintenance /infra/health returns 200"
   else
     log_fail "Maintenance /infra/health does not return 200"
@@ -69,7 +69,7 @@ else
 fi
 
 if grep -q 'location = /health' "${MAINTENANCE_CONFIG}"; then
-  if grep -A 3 'location = /health' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
+  if awk '/location = \/health/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
     log_pass "Maintenance /health returns 503"
   else
     log_fail "Maintenance /health does not return 503 (should signal unhealthy state)"
@@ -79,7 +79,7 @@ else
 fi
 
 if grep -q 'location = /ready' "${MAINTENANCE_CONFIG}"; then
-  if grep -A 3 'location = /ready' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
+  if awk '/location = \/ready/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
     log_pass "Maintenance /ready returns 503"
   else
     log_fail "Maintenance /ready does not return 503"
@@ -89,7 +89,7 @@ else
 fi
 
 if grep -q 'location / {' "${MAINTENANCE_CONFIG}"; then
-  if grep -A 3 'location / {' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
+  if awk '/^[[:space:]]*location \/ \{/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
     log_pass "Maintenance / returns 503"
   else
     log_fail "Maintenance / does not return 503"
