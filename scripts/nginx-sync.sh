@@ -49,6 +49,18 @@ log_warn()  { printf '[nginx-sync] WARN  %s\n' "$*" >&2; }
 log_error() { printf '[nginx-sync] ERROR %s\n' "$*" >&2; }
 log_ok()    { printf '[nginx-sync] OK    %s\n' "$*"; }
 
+# ---------------------------------------------------------------------------
+# Mutual-exclusion lock — prevents concurrent cron + deploy executions from
+# writing conflicting configs to nginx/live/. Uses a lock file + flock.
+# Any second invocation that cannot acquire the lock exits 0 immediately.
+# ---------------------------------------------------------------------------
+LOCK_FILE="/tmp/nginx-sync.lock"
+exec 200>"${LOCK_FILE}"
+if ! flock -n 200 2>/dev/null; then
+  log_warn "Another nginx-sync is already running (lock held). Exiting to avoid concurrent execution."
+  exit 0
+fi
+
 ALLOW_MISSING_BACKEND=false
 SELECTED_CONTAINER=""
 CONTAINER_SOURCE="unknown"
@@ -74,6 +86,46 @@ if [ -z "${API_HOSTNAME:-}" ]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# extract_nginx_location_blocks FILE LOCATION_SPEC
+#
+# Brace-aware extractor: outputs the full text of every nginx location block
+# whose opening line contains LOCATION_SPEC. Uses brace counting so nested
+# braces inside the block do not prematurely end the extraction.
+#
+# This replaces all fragile `grep -A N 'location = /...' | grep '...'` patterns
+# which fail whenever the block has more lines than N or when grep picks up
+# content from neighbouring blocks (e.g. the HTTP 301-redirect block being
+# matched alongside the HTTPS proxy_pass block).
+# ---------------------------------------------------------------------------
+extract_nginx_location_blocks() {
+  local file="$1"
+  local location_spec="$2"
+  awk -v spec="${location_spec}" '
+    !in_block && index($0, spec) > 0 && /location/ {
+      in_block = 1
+      depth = 0
+      buf = ""
+    }
+    in_block {
+      buf = buf $0 "\n"
+      n = split($0, chars, "")
+      for (i = 1; i <= n; i++) {
+        if (chars[i] == "{") depth++
+        else if (chars[i] == "}") {
+          depth--
+          if (depth == 0) {
+            printf "%s", buf
+            in_block = 0
+            buf = ""
+            break
+          }
+        }
+      }
+    }
+  ' "${file}"
+}
+
 escape_sed_replacement() {
   printf '%s' "$1" | sed -e 's/[\\/&]/\\&/g'
 }
@@ -95,6 +147,7 @@ read_backend_from_live_config() {
 resolve_backend_container() {
   local candidate=""
 
+  # 1. Explicit override via environment variable (highest priority)
   if [ -n "${API_BACKEND_CONTAINER:-}" ]; then
     if backend_name_valid "${API_BACKEND_CONTAINER}"; then
       SELECTED_CONTAINER="${API_BACKEND_CONTAINER}"
@@ -105,28 +158,36 @@ resolve_backend_container() {
     log_warn "Invalid API_BACKEND_CONTAINER '${API_BACKEND_CONTAINER}'. Ignoring."
   fi
 
+  # 2. Try the container recorded in the live config, but ONLY if it still exists.
+  # Do NOT use a stale container name — if it no longer exists, fall through to
+  # auto-discovery so we pick up the new active container (prevents oscillation
+  # during blue-green switches where the old slot is removed before the new one
+  # is healthy).
   candidate="$(read_backend_from_live_config)"
-  if [ -n "${candidate}" ] && backend_name_valid "${candidate}"; then
+  if [ -n "${candidate}" ] && backend_name_valid "${candidate}" && backend_exists "${candidate}" 2>/dev/null; then
     SELECTED_CONTAINER="${candidate}"
     CONTAINER_SOURCE="live-config"
-    log_info "Backend container (from live nginx config): ${SELECTED_CONTAINER}"
+    log_info "Backend container (from live nginx config, verified present): ${SELECTED_CONTAINER}"
     return 0
+  elif [ -n "${candidate}" ]; then
+    log_info "Live config referenced '${candidate}' but container is gone — falling through to auto-discover"
   fi
 
-  # Auto-discover blue/green deployment containers in preference order
+  # 3. Auto-discover blue/green deployment containers in preference order
   local disc_candidate
   for disc_candidate in "api-green" "api-blue"; do
     if backend_exists "${disc_candidate}" 2>/dev/null; then
       SELECTED_CONTAINER="${disc_candidate}"
-      CONTAINER_SOURCE="default"
+      CONTAINER_SOURCE="auto-discover"
       log_info "Backend container (auto-discovered): ${SELECTED_CONTAINER}"
       return 0
     fi
   done
 
+  # 4. No container found — use default name so backend_is_usable can fail gracefully
   SELECTED_CONTAINER="api-green"
   CONTAINER_SOURCE="default"
-  log_info "Backend container (default): ${SELECTED_CONTAINER}"
+  log_info "Backend container (default, no running container found): ${SELECTED_CONTAINER}"
 }
 
 render_template() {
@@ -338,42 +399,70 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   fi
   log_ok "Maintenance config validated: no proxy directives"
 
-  # Verify maintenance config returns 503 for /health
-  if ! grep -A 3 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return 503"; then
+  # Verify maintenance /health block returns 503.
+  # Uses brace-aware extraction — avoids grep -A N which fails when the block
+  # has more lines than N (maintenance /health has 5 lines: access_log,
+  # default_type, charset, return 503, closing brace).
+  _health_blocks="$(extract_nginx_location_blocks "${TEMP_CONF_DIR}/api.conf" 'location = /health')"
+  if ! printf '%s\n' "${_health_blocks}" | grep -q 'return 503'; then
     log_error "CRITICAL: Maintenance /health does not return 503"
     log_error "Maintenance mode MUST return 503 for /health to signal unhealthy state"
+    log_error "Extracted /health blocks:"
+    printf '%s\n' "${_health_blocks}" | sed 's/^/  /' >&2
     exit 1
   fi
   log_ok "Maintenance config validated: /health returns 503"
 
-  # Verify /infra/health exists
-  if ! grep -q 'location = /infra/health' "${TEMP_CONF_DIR}/api.conf"; then
+  # Verify /infra/health exists and returns 200
+  _infra_blocks="$(extract_nginx_location_blocks "${TEMP_CONF_DIR}/api.conf" 'location = /infra/health')"
+  if [ -z "${_infra_blocks}" ]; then
     log_error "CRITICAL: Maintenance config missing /infra/health endpoint"
     exit 1
   fi
-  log_ok "Maintenance config validated: /infra/health exists"
+  if ! printf '%s\n' "${_infra_blocks}" | grep -q 'return 200'; then
+    log_error "CRITICAL: Maintenance /infra/health does not return 200"
+    exit 1
+  fi
+  log_ok "Maintenance config validated: /infra/health exists and returns 200"
 else
-  # Active mode MUST have upstream or proxy_pass
+  # Active mode MUST have proxy_pass or upstream
   if ! grep -v "^[[:space:]]*#" "${TEMP_CONF_DIR}/api.conf" | grep -qE "proxy_pass|upstream"; then
     log_error "CRITICAL: Active config missing proxy directives"
     exit 1
   fi
   log_ok "Active config validated: has proxy directives"
 
-  # Verify active /health proxies to backend (MUST NOT have "return" in /health block)
-  if grep -A 5 'location = /health' "${TEMP_CONF_DIR}/api.conf" | grep -q "return [0-9]"; then
-    log_error "CRITICAL: Active /health contains static return statement"
-    log_error "Active mode MUST proxy /health to backend, not return static response"
+  # Verify active /health location blocks:
+  # (a) At least one must have proxy_pass (the HTTPS block must proxy, not return statically)
+  # (b) None must have 4xx/5xx static return codes
+  # Uses brace-aware extraction to avoid false-positive from the HTTP block's
+  # `return 301 https://...` redirect (which is intentional and NOT an error).
+  _health_blocks="$(extract_nginx_location_blocks "${TEMP_CONF_DIR}/api.conf" 'location = /health')"
+  if ! printf '%s\n' "${_health_blocks}" | grep -q 'proxy_pass'; then
+    log_error "CRITICAL: Active /health does not contain proxy_pass — HTTPS block must proxy to backend"
+    log_error "Extracted /health blocks:"
+    printf '%s\n' "${_health_blocks}" | sed 's/^/  /' >&2
+    exit 1
+  fi
+  if printf '%s\n' "${_health_blocks}" | grep -qE 'return[[:space:]]+[45][0-9][0-9]'; then
+    log_error "CRITICAL: Active /health contains a 4xx/5xx static return (only 301 redirect is permitted in HTTP block)"
+    log_error "Extracted /health blocks:"
+    printf '%s\n' "${_health_blocks}" | sed 's/^/  /' >&2
     exit 1
   fi
   log_ok "Active config validated: /health proxies to backend"
 
-  # Verify /infra/health exists
-  if ! grep -q 'location = /infra/health' "${TEMP_CONF_DIR}/api.conf"; then
+  # Verify /infra/health exists and returns 200
+  _infra_blocks="$(extract_nginx_location_blocks "${TEMP_CONF_DIR}/api.conf" 'location = /infra/health')"
+  if [ -z "${_infra_blocks}" ]; then
     log_error "CRITICAL: Active config missing /infra/health endpoint"
     exit 1
   fi
-  log_ok "Active config validated: /infra/health exists"
+  if ! printf '%s\n' "${_infra_blocks}" | grep -q 'return 200'; then
+    log_error "CRITICAL: Active /infra/health does not return 200"
+    exit 1
+  fi
+  log_ok "Active config validated: /infra/health exists and returns 200"
 fi
 
 validate_candidate_config "${TEMP_CONF_DIR}"

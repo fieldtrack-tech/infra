@@ -24,6 +24,46 @@ log_pass() { echo "[PASS] $*"; PASS=$((PASS + 1)); }
 log_fail() { echo "[FAIL] $*"; FAIL=$((FAIL + 1)); }
 log_info() { echo "[INFO] $*"; }
 
+# ---------------------------------------------------------------------------
+# extract_nginx_location_blocks FILE LOCATION_SPEC
+#
+# Brace-aware block extractor: outputs the full text of every nginx location
+# block whose opening line contains LOCATION_SPEC. Uses brace counting to
+# correctly span multi-line blocks with nested braces without cutting off early.
+#
+# This is the canonical replacement for all `grep -A N 'location'` patterns
+# which fail whenever the block has more lines than N, or when grep captures
+# text from neighbouring blocks (e.g. the HTTP 301-redirect /health location
+# being included alongside the HTTPS proxy_pass /health location).
+# ---------------------------------------------------------------------------
+extract_nginx_location_blocks() {
+  local file="$1"
+  local location_spec="$2"
+  awk -v spec="${location_spec}" '
+    !in_block && index($0, spec) > 0 && /location/ {
+      in_block = 1
+      depth = 0
+      buf = ""
+    }
+    in_block {
+      buf = buf $0 "\n"
+      n = split($0, chars, "")
+      for (i = 1; i <= n; i++) {
+        if (chars[i] == "{") depth++
+        else if (chars[i] == "}") {
+          depth--
+          if (depth == 0) {
+            printf "%s", buf
+            in_block = 0
+            buf = ""
+            break
+          }
+        }
+      }
+    }
+  ' "${file}"
+}
+
 cd "${INFRA_DIR}"
 
 # ── Check 1: Maintenance config has no proxy directives ───────────────────────
@@ -59,7 +99,8 @@ fi
 log_info "Checking maintenance config status codes..."
 
 if grep -q 'location = /infra/health' "${MAINTENANCE_CONFIG}"; then
-  if awk '/location = \/infra\/health/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 200'; then
+  _infra_blocks="$(extract_nginx_location_blocks "${MAINTENANCE_CONFIG}" 'location = /infra/health')"
+  if printf '%s\n' "${_infra_blocks}" | grep -q 'return 200'; then
     log_pass "Maintenance /infra/health returns 200"
   else
     log_fail "Maintenance /infra/health does not return 200"
@@ -69,7 +110,8 @@ else
 fi
 
 if grep -q 'location = /health' "${MAINTENANCE_CONFIG}"; then
-  if awk '/location = \/health/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
+  _health_blocks="$(extract_nginx_location_blocks "${MAINTENANCE_CONFIG}" 'location = /health')"
+  if printf '%s\n' "${_health_blocks}" | grep -q 'return 503'; then
     log_pass "Maintenance /health returns 503"
   else
     log_fail "Maintenance /health does not return 503 (should signal unhealthy state)"
@@ -79,7 +121,8 @@ else
 fi
 
 if grep -q 'location = /ready' "${MAINTENANCE_CONFIG}"; then
-  if awk '/location = \/ready/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
+  _ready_blocks="$(extract_nginx_location_blocks "${MAINTENANCE_CONFIG}" 'location = /ready')"
+  if printf '%s\n' "${_ready_blocks}" | grep -q 'return 503'; then
     log_pass "Maintenance /ready returns 503"
   else
     log_fail "Maintenance /ready does not return 503"
@@ -89,7 +132,8 @@ else
 fi
 
 if grep -q 'location / {' "${MAINTENANCE_CONFIG}"; then
-  if awk '/^[[:space:]]*location \/ \{/,/^[[:space:]]*}/' "${MAINTENANCE_CONFIG}" | grep -q 'return 503'; then
+  _root_blocks="$(extract_nginx_location_blocks "${MAINTENANCE_CONFIG}" 'location / ')"
+  if printf '%s\n' "${_root_blocks}" | grep -q 'return 503'; then
     log_pass "Maintenance / returns 503"
   else
     log_fail "Maintenance / does not return 503"
@@ -107,27 +151,31 @@ ACTIVE_CONFIG="nginx/api.conf"
 if [ ! -f "${ACTIVE_CONFIG}" ]; then
   log_fail "Active config not found: ${ACTIVE_CONFIG}"
 else
-  # Check /infra/health exists
+  # Check /infra/health exists and returns 200
   if grep -q 'location = /infra/health' "${ACTIVE_CONFIG}"; then
     log_pass "Active config has /infra/health endpoint"
   else
     log_fail "Active config missing /infra/health endpoint"
   fi
-  
-  # Check /health proxies to backend (should NOT have "return" in the HTTPS block)
-  # Note: HTTP block may have redirect (return 301), which is OK
-  HTTPS_HEALTH_BLOCK=$(awk '/server \{/{p++} p && /listen 443/{https=1} https && /location = \/health/{found=1} found{print} found && /\}/{exit}' "${ACTIVE_CONFIG}")
-  
-  if echo "${HTTPS_HEALTH_BLOCK}" | grep -q 'proxy_pass'; then
+
+  # Check /health in HTTPS block proxies to backend.
+  # Uses brace-aware extraction across all /health blocks, then verifies:
+  # (a) At least one block has proxy_pass (the HTTPS block)
+  # (b) No block has a 4xx/5xx static return code
+  # The HTTP block is allowed to have `return 301` (redirect to HTTPS) —
+  # this is intentional and must NOT be flagged as an error.
+  _active_health_blocks="$(extract_nginx_location_blocks "${ACTIVE_CONFIG}" 'location = /health')"
+
+  if printf '%s\n' "${_active_health_blocks}" | grep -q 'proxy_pass'; then
     log_pass "Active /health proxies to backend"
   else
     log_fail "Active /health does not proxy to backend"
   fi
-  
-  if echo "${HTTPS_HEALTH_BLOCK}" | grep -q 'return [45][0-9][0-9]'; then
-    log_fail "Active HTTPS /health contains static error return (should proxy only)"
+
+  if printf '%s\n' "${_active_health_blocks}" | grep -qE 'return[[:space:]]+[45][0-9][0-9]'; then
+    log_fail "Active /health contains a 4xx/5xx static return code (only 301 HTTP redirect is allowed)"
   else
-    log_pass "Active HTTPS /health does not contain static error return"
+    log_pass "Active /health contains no 4xx/5xx static return codes"
   fi
 fi
 

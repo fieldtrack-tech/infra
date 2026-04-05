@@ -179,30 +179,33 @@ jobs:
           # Verify root returns 503
           test "$(curl -ksS -o /dev/null -w "%{http_code}" -H "Host: api.test.local" https://127.0.0.1/)" = "503"
 
-      - name: Start mock API backend (container name api)
+      - name: Start mock API backend (container name api-green)
         run: |
           cat <<'EOF' >/tmp/mock-api.conf
           server {
               listen 3000;
 
               location = /health {
-                  add_header Content-Type text/plain;
-                  return 200 'ok';
+                  add_header Content-Type application/json;
+                  return 200 '{"status":"ok"}';
               }
 
               location = /ready {
-                  add_header Content-Type text/plain;
-                  return 200 'ready';
+                  add_header Content-Type application/json;
+                  return 200 '{"status":"ready"}';
               }
 
               location / {
-                  add_header Content-Type text/plain;
-                  return 200 'mock-api';
+                  add_header Content-Type application/json;
+                  return 200 '{"service":"mock-api"}';
               }
           }
           EOF
 
-          docker run -d --name api --network api_network \
+          # Container MUST be named api-green (or api-blue) so nginx-sync
+          # auto-discovers it. The sync script ONLY looks for api-green/api-blue;
+          # any other name is ignored and forces maintenance mode.
+          docker run -d --name api-green --network api_network \
             -v /tmp/mock-api.conf:/etc/nginx/conf.d/default.conf:ro \
             nginx:1.25-alpine >/dev/null
 
@@ -230,10 +233,10 @@ jobs:
           # Verify API content is served
           curl -kfsS -H "Host: api.test.local" https://127.0.0.1/ | grep -q 'mock-api'
 
-      - name: Verify api resolves on api_network
+      - name: Verify api-green resolves on api_network
         run: |
           docker run --rm --network api_network --entrypoint sh nginx:1.25-alpine -eu -c \
-            'wget -q --spider --timeout=5 --tries=1 http://api:3000/health'
+            'wget -q --spider --timeout=5 --tries=1 http://api-green:3000/health'
 
       - name: Stop API and ensure nginx enters maintenance
         env:
@@ -242,8 +245,8 @@ jobs:
           LOG_DIR: /tmp/fieldtrack/log
           STATE_DIR: /tmp/fieldtrack/state
         run: |
-          echo "=== Stopping api ==="
-          docker stop api
+          echo "=== Stopping api-green ==="
+          docker stop api-green
 
           echo "=== Running nginx-sync ==="
           set +e
@@ -339,6 +342,20 @@ jobs:
 
             sudo chown -R $USER:$USER /opt/infra
 
+            # Load environment FIRST — bootstrap.sh and nginx-sync.sh both
+            # require API_HOSTNAME, which lives in .env.monitoring on VPS.
+            # Fail fast here with a clear error rather than inside bootstrap.
+            if [ ! -f /opt/infra/.env.monitoring ]; then
+              echo "[deploy] ERROR: /opt/infra/.env.monitoring is missing."
+              echo "[deploy] This file must be present on the VPS before deploying."
+              echo "[deploy] Copy .env.monitoring.example, fill in real values, and place it at /opt/infra/.env.monitoring"
+              exit 1
+            fi
+            set -a
+            . /opt/infra/.env.monitoring
+            set +a
+            : "${API_HOSTNAME:?API_HOSTNAME must be set in /opt/infra/.env.monitoring}"
+
             echo "[deploy] Validating infra completeness..."
             bash scripts/validate-paths.sh || {
               echo "[deploy] ERROR: Infra validation failed"
@@ -379,10 +396,19 @@ jobs:
 
             echo "[deploy] Deterministic execution controller waiting for convergence limits..."
             validate_state() {
-              for i in {1..10}; do
+              for i in $(seq 1 10); do
+                 # /infra/health is on HTTP port 80 in both modes — always returns 200 directly.
                  INFRA_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/infra/health || echo "000")"
-                 HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health || echo "000")"
-                 HEALTH_BODY="$(curl -s http://localhost/health 2>/dev/null || echo "")"
+
+                 # /health behaviour differs by mode and protocol:
+                 #   Active mode HTTP  → 301 redirect to HTTPS (intentional)
+                 #   Active mode HTTPS → 200 proxied from backend
+                 #   Maintenance HTTP  → 503 static response
+                 #   Maintenance HTTPS → 503 static response
+                 # Use HTTPS with -k (self-signed cert on VPS) so both modes
+                 # return the definitive status code without redirect ambiguity.
+                 HEALTH_CODE="$(curl -ks -o /dev/null -w "%{http_code}" --resolve "${API_HOSTNAME}:443:127.0.0.1" "https://${API_HOSTNAME}/health" || echo "000")"
+                 HEALTH_BODY="$(curl -ks --resolve "${API_HOSTNAME}:443:127.0.0.1" "https://${API_HOSTNAME}/health" 2>/dev/null || echo "")"
 
                  MATCH=1
                  if [ "${INFRA_CODE}" != "200" ]; then MATCH=0; fi
@@ -391,11 +417,13 @@ jobs:
                  # Slot-file routing was removed; health-based routing is canonical.
                  if docker ps --format '{{.Names}}' | grep -qE '^api-(blue|green)$'; then
                    # At least one API container is running: active mode expected.
+                   # HTTPS /health must return 200 and must NOT contain 'maintenance'.
                    if [ "${HEALTH_CODE}" != "200" ] || echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
                      MATCH=0
                    fi
                  else
                    # No API containers running: maintenance mode expected.
+                   # HTTPS /health must return 503 and body must contain 'maintenance'.
                    if [ "${HEALTH_CODE}" != "503" ] || ! echo "${HEALTH_BODY}" | grep -q 'maintenance'; then
                      MATCH=0
                    fi
@@ -406,7 +434,7 @@ jobs:
                    return 0
                  fi
 
-                 echo "[deploy] Mismatch observed on iteration ${i}. Sleeping 2s..."
+                 echo "[deploy] Mismatch observed on iteration ${i} (INFRA=${INFRA_CODE}, HEALTH=${HEALTH_CODE}). Sleeping 2s..."
                  sleep 2
               done
               return 1

@@ -69,16 +69,12 @@ log_info "Checking state directory..."
 STATE_DIR="/var/lib/fieldtrack"
 if [ -d "${STATE_DIR}" ]; then
   log_pass "State directory exists: ${STATE_DIR}"
-  
+
+  # Warn if a legacy active-slot file exists \u2014 it belongs to the old slot-based
+  # routing scheme which was replaced by health-based routing.  If present it
+  # indicates incomplete cleanup from a previous version.
   if [ -f "${STATE_DIR}/active-slot" ]; then
-    SLOT_VALUE="$(cat "${STATE_DIR}/active-slot" 2>/dev/null | tr -d '[:space:]')"
-    if [ "${SLOT_VALUE}" = "blue" ] || [ "${SLOT_VALUE}" = "green" ]; then
-      log_pass "Active slot file is valid: ${SLOT_VALUE}"
-    else
-      log_fail "Active slot file has invalid value: ${SLOT_VALUE}"
-    fi
-  else
-    log_info "No active-slot file (expected in health-based routing; blue/green slot is detected dynamically)"
+    log_warn "Legacy active-slot file found at ${STATE_DIR}/active-slot \u2014 remove it (slot-based routing was replaced by health-based routing)"
   fi
 else
   log_warn "State directory does not exist (will be created by bootstrap)"

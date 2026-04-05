@@ -33,7 +33,10 @@ services:
         max-file: "3"
 
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      # Use /infra/health — answered by nginx directly, never depends on backend.
+      # /health returns 503 in maintenance mode (no backend), which would make
+      # the container appear unhealthy even though nginx itself is alive.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/infra/health"]
       interval: 30s
       timeout: 5s
       retries: 3

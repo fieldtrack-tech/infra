@@ -70,13 +70,21 @@ assert_no_hardcoded_usage() {
   local matches
 
   # Collect candidate matches from script files (filename:lineno:content).
-  # Then filter out lines where the content portion (after filename:lineno:) is a comment,
-  # and also ignore canonical variable definitions.
+  # Exclusion rules (applied in order):
+  #   1. Lines where the content portion is a comment (starts with #)
+  #   2. Lines that contain a canonical variable definition/default
+  #      (INFRA_ROOT, LOG_DIR, STATE_DIR, EXPECTED_INFRA_ROOT) — these are
+  #      allowed because they explicitly declare the path as a configurable
+  #      default, not hard-wire it into logic.
+  #   3. check-contract.sh itself — it intentionally references these names
+  #      in the allowlist patterns above and in its own documentation.
+  # We exclude by literal filename to avoid accidentally suppressing violations
+  # in other scripts that happen to have a similar name.
   matches=$(grep -nE '/opt/infra|/var/log/fieldtrack|/var/lib/fieldtrack' scripts/*.sh || true)
   matches=$(printf '%s\n' "${matches}" \
     | grep -vE '^[^:]+:[0-9]+:\s*#' \
     | grep -vE '\b(INFRA_ROOT|LOG_DIR|STATE_DIR|EXPECTED_INFRA_ROOT)\b' \
-    | grep -vF "$(basename "$0")" || true)
+    | grep -vF 'scripts/check-contract.sh:' || true)
 
   if [[ -n "$matches" ]]; then
     echo "[check-contract] ERROR Hardcoded path usage found:"
