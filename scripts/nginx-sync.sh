@@ -424,14 +424,29 @@ trap cleanup EXIT
 
 render_template "${TARGET_TEMPLATE}" "${TEMP_CONF_DIR}/api.conf"
 
+# Guard: render_template must produce a non-empty file. An empty file means
+# sed failed or the source template was missing/unreadable.
+if [ ! -s "${TEMP_CONF_DIR}/api.conf" ]; then
+  log_error "CRITICAL: Rendered config is empty (render failed or template missing)"
+  log_error "Template: ${TARGET_TEMPLATE}"
+  exit 1
+fi
+
 # CRITICAL: Validate config matches expected mode
 log_info "Validating rendered config matches mode: ${ROUTING_MODE}"
 if [ "${ROUTING_MODE}" = "maintenance" ]; then
-  # Maintenance mode MUST NOT have proxy directives
-  if grep -v "^[[:space:]]*#" "${TEMP_CONF_DIR}/api.conf" | grep -qE "proxy_pass|upstream|api-blue|api-green|set \\\$api_backend"; then
+  # Maintenance mode MUST NOT have proxy directives.
+  #
+  # NOTE: Do NOT use `grep -v ... | grep -q` here. With set -o pipefail, when
+  # grep -q finds a match and exits early (its purpose with -q), grep -v
+  # receives SIGPIPE and exits 141. pipefail makes the pipeline exit 141
+  # (rightmost non-zero), which `if` sees as failure — a false positive.
+  # Use a single awk invocation to avoid all pipe-related exit-code issues.
+  if awk '/^[[:space:]]*#/{next} /proxy_pass|\$api_backend|api-blue|api-green/{found=1;exit} END{exit(found?0:1)}' \
+      "${TEMP_CONF_DIR}/api.conf"; then
     log_error "CRITICAL: Maintenance config contains proxy directives or backend references"
     log_error "This will cause 502 errors. Config validation failed."
-    grep -n "proxy_pass\|upstream\|api-blue\|api-green\|set \\\$api_backend" "${TEMP_CONF_DIR}/api.conf" || true
+    grep -n 'proxy_pass\|\$api_backend\|api-blue\|api-green' "${TEMP_CONF_DIR}/api.conf" | sed 's/^/  /' >&2 || true
     exit 1
   fi
   log_ok "Maintenance config validated: no proxy directives"
@@ -462,9 +477,15 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
   fi
   log_ok "Maintenance config validated: /infra/health exists and returns 200"
 else
-  # Active mode MUST have proxy_pass or upstream
-  if ! grep -v "^[[:space:]]*#" "${TEMP_CONF_DIR}/api.conf" | grep -qE "proxy_pass|upstream"; then
+  # Active mode MUST have proxy_pass.
+  # Same awk-over-pipe rationale as above.
+  if ! awk '/^[[:space:]]*#/{next} /proxy_pass/{found=1;exit} END{exit(found?0:1)}' \
+      "${TEMP_CONF_DIR}/api.conf"; then
     log_error "CRITICAL: Active config missing proxy directives"
+    log_error "Rendered config first 30 lines:"
+    head -30 "${TEMP_CONF_DIR}/api.conf" | sed 's/^/  /' >&2
+    log_error "proxy_pass occurrences (should be non-zero):"
+    grep -n 'proxy_pass' "${TEMP_CONF_DIR}/api.conf" | sed 's/^/  /' >&2 || log_error "  (none found)"
     exit 1
   fi
   log_ok "Active config validated: has proxy directives"
