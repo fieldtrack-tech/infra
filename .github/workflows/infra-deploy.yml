@@ -397,8 +397,13 @@ jobs:
             echo "[deploy] Deterministic execution controller waiting for convergence limits..."
             validate_state() {
               for i in $(seq 1 10); do
-                 # /infra/health is on HTTP port 80 in both modes — always returns 200 directly.
-                 INFRA_CODE="$(curl -s -o /dev/null -w "%{http_code}" http://localhost/infra/health || echo "000")"
+                 # /infra/health must return 200 in both modes.
+                 # Use HTTPS with --resolve (same pattern as all other probes):
+                 # avoids the HTTP-to-HTTPS redirect that the active config's
+                 # HTTP server block applies to non-exact paths, and avoids
+                 # Host-header mismatch when curl defaults to Host: localhost
+                 # while the nginx server_name is the real API hostname.
+                 INFRA_CODE="$(curl -ks -o /dev/null -w "%{http_code}" --resolve "${API_HOSTNAME}:443:127.0.0.1" "https://${API_HOSTNAME}/infra/health" || echo "000")"
 
                  # /health behaviour differs by mode and protocol:
                  #   Active mode HTTP  → 301 redirect to HTTPS (intentional)
