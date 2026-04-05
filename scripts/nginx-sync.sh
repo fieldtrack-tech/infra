@@ -135,9 +135,14 @@ read_backend_from_live_config() {
     return 0
   fi
 
+  # grep exits 1 when there is no match (e.g. the live config is in maintenance
+  # mode and has no `set $api_backend` directive).  With set -o pipefail that
+  # non-zero exit propagates through the pipeline and set -e would abort the
+  # script.  `|| true` suppresses it so the function always returns 0 and the
+  # caller receives an empty string when nothing is found.
   grep -oE 'set \$api_backend "http://[a-zA-Z0-9_.-]+:3000"' "${OUTPUT_FILE}" 2>/dev/null \
     | head -1 \
-    | sed -n 's/.*http:\/\/\([a-zA-Z0-9_.-]*\):3000.*/\1/p'
+    | sed -n 's/.*http:\/\/\([a-zA-Z0-9_.-]*\):3000.*/\1/p' || true
 }
 
 resolve_backend_container() {
