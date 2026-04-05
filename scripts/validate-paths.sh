@@ -122,7 +122,7 @@ else
   log_pass "No hardcoded /home/ashish paths found"
 fi
 
-if grep -r "~/infra" "${INFRA_DIR}/scripts" 2>/dev/null | grep -v "validate-paths.sh" | grep -q .; then
+if grep -r '~/infra' "${INFRA_DIR}/scripts" 2>/dev/null | grep -v "validate-paths.sh" | grep -q .; then
   log_fail "Found hardcoded ~/infra paths in scripts"
 else
   log_pass "No hardcoded ~/infra paths found in scripts"
