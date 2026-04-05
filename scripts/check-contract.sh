@@ -75,7 +75,8 @@ assert_no_hardcoded_usage() {
   matches=$(grep -nE '/opt/infra|/var/log/fieldtrack|/var/lib/fieldtrack' scripts/*.sh || true)
   matches=$(printf '%s\n' "${matches}" \
     | grep -vE '^[^:]+:[0-9]+:\s*#' \
-    | grep -vE '\b(INFRA_ROOT|LOG_DIR|STATE_DIR)\b' || true)
+    | grep -vE '\b(INFRA_ROOT|LOG_DIR|STATE_DIR|EXPECTED_INFRA_ROOT)\b' \
+    | grep -vF "$(basename "$0")" || true)
 
   if [[ -n "$matches" ]]; then
     echo "[check-contract] ERROR Hardcoded path usage found:"
@@ -116,19 +117,27 @@ assert_no_hardcoded_usage
 # can contain executable commands; we should flag non-commented occurrences
 # there as well. To avoid false positives (env: keys, docs, etc.) only extract
 # the literal script: | blocks and scan their contents.
+# Scan only script: | blocks (SSH action payloads) — not env: keys, run: blocks, or YAML docs.
+# infra-deploy.yml is the VPS provisioning script and must reference /opt/infra directly
+# (cd /opt/infra, git clone /opt/infra, etc.) — exclude it for the same reason we exclude
+# check-contract.sh from the scripts scan: it legitimately uses the canonical path by design.
+# Any other workflow file that introduces a hardcoded path in a script: | block will be caught.
 log_info "Scanning GitHub Actions workflow script:| blocks for hardcoded paths..."
 workflow_matches=$(awk '
-  /script: *\|/ { in_block=1; next }
-  /^[^ \t]/ { in_block=0 }
+  /script:[[:space:]]*\|/ { in_block=1; next }
+  in_block && /^[^[:space:]]/ { in_block=0 }
   in_block { print FILENAME ":" FNR ":" $0 }
 ' .github/workflows/*.yml 2>/dev/null \
+  | grep -vF 'infra-deploy.yml' \
   | grep -E '/opt/infra|/var/log/fieldtrack|/var/lib/fieldtrack' \
-  | grep -vE '^\s*#' || true)
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+  | grep -vE '\b(INFRA_ROOT|LOG_DIR|STATE_DIR|EXPECTED_INFRA_ROOT)\b' \
+  || true)
 
 if [ -n "${workflow_matches}" ]; then
-  log_error "Hardcoded path usage found in GitHub Actions workflow script blocks (non-comment lines):"
+  log_error "Hardcoded path usage found in GitHub Actions workflow script blocks:"
   printf '%s\n' "${workflow_matches}" >&2
-  log_error "Workflows may contain executable script blocks; avoid hardcoded absolute paths. Use env vars (INFRA_ROOT/LOG_DIR/STATE_DIR) or relative references."
+  log_error "Use env vars (INFRA_ROOT/LOG_DIR/STATE_DIR) instead of hardcoded absolute paths."
   exit 1
 fi
 log_ok "No forbidden hardcoded paths found in workflow script blocks"
