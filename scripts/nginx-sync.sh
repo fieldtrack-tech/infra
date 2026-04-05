@@ -277,20 +277,42 @@ wait_for_nginx_running() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# HTTP probes — all run on the HOST using curl, NOT inside the nginx container.
+#
+# Rationale: the nginx container runs Alpine with BusyBox wget. BusyBox wget:
+#   - Does not guarantee a clean 3-digit status code from `wget -S` output
+#     (CRLF line endings, format varies across BusyBox versions)
+#   - Does NOT write the response body to stdout for non-2xx responses when
+#     the shell `|| echo ""` pattern is used (exit-code propagation)
+#   - The `--spider` option exits non-zero for anything outside 2xx/3xx,
+#     but gives no HTTP status code to parse
+#
+# curl on the host (Ubuntu CI / Debian VPS) is deterministic:
+#   `curl -s -o /dev/null -w "%{http_code}"` always emits exactly 3 digits
+#   `curl -s` emits the full response body regardless of HTTP status code
+# ---------------------------------------------------------------------------
 probe_nginx_liveness() {
-  # Use /infra/health for nginx liveness (never depends on backend)
-  docker exec nginx sh -eu -c \
-    "wget -q --spider --timeout=5 --tries=1 http://127.0.0.1/infra/health"
+  # /infra/health is answered by nginx directly — never depends on backend.
+  # Use -f (--fail) so curl exits non-zero for any non-2xx response.
+  curl -sf --max-time 5 \
+    -H "Host: ${API_HOSTNAME}" \
+    http://127.0.0.1/infra/health >/dev/null 2>&1
 }
 
 probe_route_through_nginx() {
-  docker exec nginx sh -eu -c \
-    "wget -q --spider --timeout=5 --tries=1 --no-check-certificate --header='Host: ${API_HOSTNAME}' https://127.0.0.1/health"
+  # HTTPS probe: use --resolve to route to 127.0.0.1 while sending correct
+  # SNI/Host. -k skips cert verification (self-signed on VPS; CI uses self-signed).
+  # -f exits non-zero for 4xx/5xx so the caller can detect failures.
+  curl -sf --max-time 10 -k \
+    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+    "https://${API_HOSTNAME}/health" >/dev/null 2>&1
 }
 
 probe_ready_through_nginx() {
-  docker exec nginx sh -eu -c \
-    "wget -q --spider --timeout=5 --tries=1 --no-check-certificate --header='Host: ${API_HOSTNAME}' https://127.0.0.1/ready"
+  curl -sf --max-time 10 -k \
+    --resolve "${API_HOSTNAME}:443:127.0.0.1" \
+    "https://${API_HOSTNAME}/ready" >/dev/null 2>&1
 }
 
 run_probe_with_retries() {
@@ -505,7 +527,12 @@ fi
 log_info "Validating nginx responses match expected mode..."
 
 # Always verify /infra/health works (nginx liveness)
-INFRA_HEALTH_CODE="$(docker exec nginx sh -c "wget -q -O /dev/null -S http://127.0.0.1/infra/health 2>&1 | grep 'HTTP/' | awk '{print \$2}'" || echo "000")"
+# curl -s -o /dev/null -w "%{http_code}" always yields exactly 3 decimal digits
+# with no CRLF, no extra text — safe for direct string comparison.
+INFRA_HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+  --max-time 5 \
+  -H "Host: ${API_HOSTNAME}" \
+  http://127.0.0.1/infra/health 2>/dev/null || echo "000")"
 if [ "${INFRA_HEALTH_CODE}" != "200" ]; then
   log_error "CRITICAL: /infra/health returned ${INFRA_HEALTH_CODE} (expected 200)"
   rollback_live_config
@@ -514,11 +541,23 @@ fi
 log_ok "/infra/health correctly returns 200 (nginx is alive)"
 
 if [ "${ROUTING_MODE}" = "maintenance" ]; then
-  # In maintenance mode, /health should return 503
-  HEALTH_CODE="$(docker exec nginx sh -c "wget -q -O /dev/null -S http://127.0.0.1/health 2>&1 | grep 'HTTP/' | awk '{print \$2}'" || echo "000")"
+  # In maintenance mode, /health must return 503 with a body containing 'maintenance'.
+  # IMPORTANT: use plain HTTP (port 80) — the maintenance HTTP block serves 503
+  # directly without redirecting (only the root '/' redirects to HTTPS).
+  # curl -s outputs the body even for non-2xx responses (unlike BusyBox wget).
+  HEALTH_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 5 \
+    -H "Host: ${API_HOSTNAME}" \
+    http://127.0.0.1/health 2>/dev/null || echo "000")"
+  HEALTH_BODY="$(curl -s \
+    --max-time 5 \
+    -H "Host: ${API_HOSTNAME}" \
+    http://127.0.0.1/health 2>/dev/null || echo "")"
+
   if [ "${HEALTH_CODE}" = "502" ]; then
     log_error "CRITICAL: Maintenance /health returned 502 (backend resolution failure)"
-    log_error "This means nginx is trying to proxy to backends that don't exist"
+    log_error "This means nginx is trying to proxy to a backend that does not exist"
+    log_error "Config is in maintenance mode but still has proxy_pass — template issue"
     rollback_live_config
     exit 1
   elif [ "${HEALTH_CODE}" = "503" ]; then
@@ -529,14 +568,17 @@ if [ "${ROUTING_MODE}" = "maintenance" ]; then
     rollback_live_config
     exit 1
   else
-    log_warn "Maintenance /health returned unexpected code: ${HEALTH_CODE} (expected 503)"
+    log_error "CRITICAL: Maintenance /health returned unexpected code: ${HEALTH_CODE} (expected 503)"
+    rollback_live_config
+    exit 1
   fi
 
-  # Verify response contains "maintenance"
-  HEALTH_BODY="$(docker exec nginx sh -c "wget -q -O - http://127.0.0.1/health 2>/dev/null" || echo "")"
-  if ! echo "${HEALTH_BODY}" | grep -q "maintenance"; then
-    log_error "CRITICAL: Maintenance /health response does not contain 'maintenance'"
-    log_error "Response: ${HEALTH_BODY}"
+  # Verify response body contains 'maintenance' — proves the static JSON body
+  # from the return directive is being served, not nginx's default error page.
+  if ! printf '%s' "${HEALTH_BODY}" | grep -q 'maintenance'; then
+    log_error "CRITICAL: Maintenance /health response body does not contain 'maintenance'"
+    log_error "Expected: {\"status\":\"maintenance\",...}"
+    log_error "Received: ${HEALTH_BODY}"
     rollback_live_config
     exit 1
   fi

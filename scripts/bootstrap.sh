@@ -296,9 +296,11 @@ log_ok "nginx sync completed"
 wait_for_nginx() {
   local attempt
   log_info "Waiting for nginx liveness..."
+  # Use host-side curl against port 80 — more reliable than docker exec + BusyBox
+  # wget. curl is already required by this script (binary check above).
   # shellcheck disable=SC2034
   for attempt in $(seq 1 30); do
-    if docker exec nginx sh -eu -c "wget -q --spider --timeout=5 --tries=1 http://127.0.0.1/infra/health" >/dev/null 2>&1; then
+    if curl -sf --max-time 3 http://127.0.0.1/infra/health >/dev/null 2>&1; then
       log_ok "nginx ready"
       return 0
     fi
