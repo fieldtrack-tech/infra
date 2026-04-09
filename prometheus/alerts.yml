@@ -175,6 +175,33 @@ groups:
           4. If transient: failed jobs auto-expire after 72 h; monitor retry_intents_dead metric
           5. If persistent: hotfix deployment required — see docs/ROLLBACK_QUICKREF.md
 
+  # Phase 2: Snapshot health monitoring — fire when /internal/snapshot-health
+  # returns 503 (degraded) for more than 5 minutes. This means snapshot tables
+  # (employee_last_state, org_dashboard_snapshot, employee_metrics_snapshot) are
+  # stale (>10 min since last update), causing admin dashboard and segmentation
+  # to display outdated information.
+  - alert: SnapshotHealthDegraded
+    expr: probe_success{job="fieldtrack-snapshot-health"} == 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Snapshot tables are stale (>10 minutes)"
+      description: >-
+        The snapshot health endpoint (/internal/snapshot-health) has been
+        returning degraded status for more than 5 minutes. Employee activity
+        segmentation, dashboard KPIs, and real-time counts may be outdated.
+        Check the reconciliation worker and snapshot queue.
+      runbook_url: "https://github.com/fieldtrack/fieldtrack/blob/main/docs/OBSERVABILITY_ARCHITECTURE.md"
+      runbook: |
+        Cause: Snapshot reconciliation job stalled, Redis connection lost, or worker crashed.
+        Actions:
+          1. Check snapshot worker logs: docker logs api-blue | grep "snapshot" or docker logs api-green | grep "snapshot"
+          2. Verify Redis connectivity: redis-cli -u $REDIS_URL ping
+          3. Check queue depth via GET /internal/queues/status
+          4. Manually trigger reconciliation if needed
+          5. Admin dashboard will show "Snapshot data may be stale" banner
+
 # ---------------------------------------------------------
 # HOST ALERTS
 # ---------------------------------------------------------
